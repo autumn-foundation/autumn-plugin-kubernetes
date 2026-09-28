@@ -411,14 +411,21 @@ impl KubernetesPlugin {
     }
 }
 
-/// Checks the API server every [`crate::health::UP_TTL`] until `cancel`.
+/// Checks the API server each time the stored result gets old, until
+/// `cancel`. So `kubernetes_api_up` is at most about one TTL old.
 async fn refresh_health(health: Arc<KubernetesHealth>, cancel: CancellationToken) {
     loop {
-        health.refresh().await;
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            () = tokio::time::sleep(crate::health::UP_TTL) => {}
+            () = health.refresh() => {}
+        }
+        // A floor stops a busy loop if the clock does not move.
+        let wait = health.until_stale().await.max(Duration::from_millis(100));
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(wait) => {}
         }
     }
 }

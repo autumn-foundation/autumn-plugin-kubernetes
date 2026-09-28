@@ -125,16 +125,28 @@ fn dotenv_applies_in_dev_like_autumn() {
 #[test]
 fn manifests_need_an_explicit_profile() {
     let dir = temp_dir("noprofile");
-    let out = Command::new(example("manifests"))
-        .args(["shop", "img"])
-        .current_dir(&dir)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("AUTUMN_MANIFEST_DIR", &dir)
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("profile"));
+    // Round 3: an empty `--profile` also falls back to dev in autumn.
+    for extra in [
+        &[][..],
+        &["--profile"][..],
+        &["--profile="][..],
+        &["--profile", " "][..],
+    ] {
+        let out = Command::new(example("manifests"))
+            .args(["shop", "img"])
+            .args(extra)
+            .current_dir(&dir)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("AUTUMN_MANIFEST_DIR", &dir)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("profile"),
+            "{extra:?}"
+        );
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 

@@ -225,6 +225,16 @@ fn apply_env(
     Ok(())
 }
 
+/// A `.env` error. A parse error can repeat the line (a secret), so it shows
+/// only the file and the line number. A read error (line 0) shows its text.
+fn dotenv_error(e: &autumn_web::dotenv::DotenvError) -> KubeError {
+    if e.line == 0 {
+        config_err(format!(".env: {}: {}", e.path.display(), e.message))
+    } else {
+        config_err(format!(".env: {}:{}: not valid", e.path.display(), e.line))
+    }
+}
+
 /// `dir/file` if it exists, else `file` in the working directory. autumn-web
 /// does the same. Thus a build path in the binary does not stop the plugin
 /// from finding files.
@@ -395,10 +405,7 @@ impl KubernetesConfig {
             .var("AUTUMN_MANIFEST_DIR")
             .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from);
         // `.env` first, then the process env, so the process env wins.
-        // The error text can repeat the `.env` line (a secret). Show only
-        // the file and the line number.
-        let mut env = autumn_web::dotenv::resolve_process_dotenv()
-            .map_err(|e| config_err(format!(".env: {}:{}: not valid", e.path.display(), e.line)))?;
+        let mut env = autumn_web::dotenv::resolve_process_dotenv().map_err(|e| dotenv_error(&e))?;
         env.extend(
             std::env::vars_os()
                 .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
@@ -806,6 +813,26 @@ mod tests {
             std::path::PathBuf::from("autumn-prod.toml")
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dotenv_error_text_hides_the_line_but_not_io_errors() {
+        let e = autumn_web::dotenv::DotenvError {
+            path: "/app/.env".into(),
+            line: 3,
+            message: "bad line: SECRET=abc".into(),
+        };
+        let text = dotenv_error(&e).to_string();
+        assert!(
+            text.contains("/app/.env:3") && !text.contains("SECRET"),
+            "{text}"
+        );
+        let io = autumn_web::dotenv::DotenvError {
+            path: "/app/.env".into(),
+            line: 0,
+            message: "failed to read: Permission denied".into(),
+        };
+        assert!(dotenv_error(&io).to_string().contains("Permission denied"));
     }
 
     #[test]
