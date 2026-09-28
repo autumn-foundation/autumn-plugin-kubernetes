@@ -51,3 +51,12 @@ K8S_OPENAPI_ENABLED_VERSION=1.32 cargo check --lib   # each of 1.32..1.36
 - Time in tests: `#[tokio::test(start_paused = true)]`. The elector uses `tokio::time`.
 - Leader belief must end before a takeover is possible. Do not extend belief on an error.
 - Tests that clear `proxy_url` do it only for the loopback test server.
+
+## Autumn API notes (0.7.0)
+
+- `TestApp` runs startup hooks on a runtime that ends after startup. Tasks that
+  the plugin spawns (elector, watches) stop with it. Test runtime behavior with
+  `KubernetesPlugin::start`, not with `TestApp`.
+- `TestApp` does not run shutdown hooks. `plugin::tests` calls the hook body.
+- autumn drops a shutdown hook future when the budget ends. The hook spawns
+  its work, so the work still ends in order.

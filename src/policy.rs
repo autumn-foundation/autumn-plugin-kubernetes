@@ -63,12 +63,14 @@ pub const fn decide(
     }
 }
 
-/// The lease duration for expiry. A positive record value wins. Else the
-/// local config value.
+/// The lease duration for expiry. A positive record value wins, up to
+/// `MAX_LEASE_MS`. Else the local config value. The cap stops a foreign
+/// writer from holding the lease for years.
 #[must_use]
 pub const fn effective_duration_ms(record_secs: i32, fallback_ms: u64) -> u64 {
     if record_secs > 0 {
-        record_secs.unsigned_abs() as u64 * 1000
+        let ms = record_secs.unsigned_abs() as u64 * 1000;
+        if ms < MAX_LEASE_MS { ms } else { MAX_LEASE_MS }
     } else {
         fallback_ms
     }
@@ -196,8 +198,23 @@ mod tests {
     }
 
     #[test]
+    fn jitter_edges() {
+        assert_eq!(jittered_ms(1_000, 200), 1_200, "top of the range");
+        assert_eq!(jittered_ms(1_000, 201), 1_000, "wraps to the bottom");
+        assert_eq!(jittered_ms(0, 7), 0);
+    }
+
+    #[test]
+    fn record_duration_is_capped() {
+        assert_eq!(effective_duration_ms(i32::MAX, 15_000), MAX_LEASE_MS);
+        assert_eq!(effective_duration_ms(3_600, 15_000), MAX_LEASE_MS);
+        assert_eq!(effective_duration_ms(3_601, 15_000), MAX_LEASE_MS);
+    }
+
+    #[test]
     fn effective_duration_prefers_record() {
         assert_eq!(effective_duration_ms(20, 15_000), 20_000);
+        assert_eq!(effective_duration_ms(3_599, 15_000), 3_599_000);
         assert_eq!(effective_duration_ms(0, 15_000), 15_000);
         assert_eq!(effective_duration_ms(-5, 15_000), 15_000);
     }
@@ -279,6 +296,32 @@ mod tests {
             let takes_over = decide(false, false, observed_age_ms(now, observed), lease) == Action::Acquire
                 && now >= observed;
             prop_assert!(!(believes && takes_over));
+        }
+
+        #[test]
+        fn effective_duration_matches_spec(rec: i32, fallback: u64) {
+            let r = effective_duration_ms(rec, fallback);
+            if rec > 0 {
+                prop_assert_eq!(r, (u64::from(rec.unsigned_abs()) * 1000).min(MAX_LEASE_MS));
+            } else {
+                prop_assert_eq!(r, fallback);
+            }
+        }
+
+        #[test]
+        fn transitions_match_spec(old: u32, me: bool) {
+            let r = next_transitions(old, me);
+            prop_assert_eq!(r, if me { old } else { old.saturating_add(1) });
+        }
+
+        #[test]
+        fn observation_matches_spec(prev: Option<u64>, changed: bool, now: u64, at: u64) {
+            let r = observed_at(prev, changed, now);
+            match prev {
+                Some(p) if !changed => prop_assert_eq!(r, p),
+                _ => prop_assert_eq!(r, now),
+            }
+            prop_assert_eq!(observed_age_ms(now, at), now.saturating_sub(at));
         }
 
         #[test]

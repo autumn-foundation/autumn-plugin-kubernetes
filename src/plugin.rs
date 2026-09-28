@@ -27,7 +27,8 @@ use crate::pod::PodInfo;
 pub const PLUGIN_NAME: &str = "autumn-plugin-kubernetes";
 /// Time limit for the startup API check when `required = true`.
 pub const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-/// Time for leader tasks to return after their token is cancelled.
+/// Upper limit for leader tasks to return after their token is cancelled.
+/// The real limit also stays below the takeover gap. See `task_stop_timeout`.
 pub const TASK_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time limit for the `Stopping` event at shutdown.
 pub const STOP_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -259,6 +260,39 @@ impl KubernetesPlugin {
             state.insert_extension(store.clone());
             store
         });
+        let le = &config.leader_election;
+        let (elector, tasks, leadership) = if le.enabled && le.campaigns_for(role) {
+            let identity = if le.identity.is_empty() {
+                default_identity(&pod)
+            } else {
+                le.identity.clone()
+            };
+            // `new` can fail. Nothing runs yet, so nothing leaks.
+            let handle =
+                LeaderElector::new(Arc::clone(&api), namespace.clone(), identity, le.clone())?
+                    .with_metrics(Arc::clone(&metrics))
+                    .with_events(events.clone())
+                    .start();
+            let leadership = handle.leadership();
+            state.insert_extension(leadership.clone());
+            let tasks = (!self.leader_tasks.is_empty()).then(|| {
+                LeaderTasks::start(
+                    leadership.clone(),
+                    self.leader_tasks,
+                    state.clone(),
+                    task_stop_timeout(le),
+                )
+            });
+            (Some(handle), tasks, Some(leadership))
+        } else {
+            if le.enabled {
+                tracing::info!(
+                    role = role.as_str(),
+                    "kubernetes: this role does not take part in leader election"
+                );
+            }
+            (None, None, None)
+        };
         let watches: Vec<JoinHandle<()>> = config_maps
             .iter()
             .flat_map(|store| {
@@ -275,39 +309,6 @@ impl KubernetesPlugin {
             })
             .collect();
 
-        let le = &config.leader_election;
-        let (elector, tasks, leadership) = if le.enabled && le.campaigns_for(role) {
-            let identity = if le.identity.is_empty() {
-                default_identity(&pod)
-            } else {
-                le.identity.clone()
-            };
-            let handle =
-                LeaderElector::new(Arc::clone(&api), namespace.clone(), identity, le.clone())?
-                    .with_metrics(Arc::clone(&metrics))
-                    .with_events(events.clone())
-                    .start();
-            let leadership = handle.leadership();
-            state.insert_extension(leadership.clone());
-            let tasks = (!self.leader_tasks.is_empty()).then(|| {
-                LeaderTasks::start(
-                    leadership.clone(),
-                    self.leader_tasks,
-                    state.clone(),
-                    TASK_STOP_TIMEOUT,
-                )
-            });
-            (Some(handle), tasks, Some(leadership))
-        } else {
-            if le.enabled {
-                tracing::info!(
-                    role = role.as_str(),
-                    "kubernetes: this role does not take part in leader election"
-                );
-            }
-            (None, None, None)
-        };
-
         health.set(HealthTarget {
             api: Some(Arc::clone(&api)),
             mode,
@@ -320,6 +321,7 @@ impl KubernetesPlugin {
         Ok(KubernetesRuntime {
             mode,
             namespace: Some(namespace),
+            _guard: cancel.clone().drop_guard(),
             cancel,
             watches,
             elector,
@@ -366,7 +368,7 @@ impl KubernetesPlugin {
                     leadership.clone(),
                     self.leader_tasks,
                     state.clone(),
-                    TASK_STOP_TIMEOUT,
+                    task_stop_timeout(le),
                 )
             });
             (Some(tx), Some(leadership), tasks)
@@ -392,6 +394,7 @@ impl KubernetesPlugin {
             mode,
             namespace: None,
             cancel: CancellationToken::new(),
+            _guard: CancellationToken::new().drop_guard(),
             watches: Vec::new(),
             elector: None,
             local_leader,
@@ -403,6 +406,34 @@ impl KubernetesPlugin {
             config_maps: None,
         }
     }
+}
+
+/// The `on_shutdown` hook body. autumn can drop the returned future when the
+/// shutdown budget ends. The work runs in its own task, so it still ends in
+/// order: tasks stop, the lease is released, the event is written.
+fn shutdown_hook(
+    slot: &Mutex<Option<KubernetesRuntime>>,
+) -> impl Future<Output = ()> + Send + use<> {
+    let rt = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let work = rt.map(|rt| tokio::spawn(rt.shutdown()));
+    async move {
+        if let Some(work) = work
+            && let Err(e) = work.await
+        {
+            tracing::warn!(error = %e, "kubernetes: shutdown task ended with an error");
+        }
+    }
+}
+
+/// Time for leader tasks to stop after belief ends. It is below the takeover
+/// gap (`lease_duration - renew_deadline`), so an old task is aborted before
+/// another replica can lead. At most [`TASK_STOP_TIMEOUT`].
+pub(crate) fn task_stop_timeout(le: &crate::config::LeaderElectionConfig) -> Duration {
+    let gap = le
+        .lease_duration_ms()
+        .saturating_sub(le.renew_deadline_ms());
+    let margin = gap / 5;
+    Duration::from_millis(gap.saturating_sub(margin).max(1)).min(TASK_STOP_TIMEOUT)
 }
 
 /// `<pod name or host name>-<8 hex digits>`. The suffix keeps two processes
@@ -417,6 +448,8 @@ pub struct KubernetesRuntime {
     mode: &'static str,
     namespace: Option<String>,
     cancel: CancellationToken,
+    /// Cancels the watches when the runtime is dropped with no shutdown.
+    _guard: tokio_util::sync::DropGuard,
     watches: Vec<JoinHandle<()>>,
     elector: Option<ElectorHandle>,
     local_leader: Option<tokio::sync::watch::Sender<crate::leader::LeaderState>>,
@@ -477,13 +510,8 @@ impl KubernetesRuntime {
     /// Writes `Stopping`, stops leader tasks, releases the lease, and stops
     /// the watches.
     pub async fn shutdown(self) {
-        if let Some(events) = &self.events
-            && tokio::time::timeout(STOP_EVENT_TIMEOUT, events.emit(events::stopping()))
-                .await
-                .is_err()
-        {
-            tracing::debug!("kubernetes: Stopping event timed out");
-        }
+        // Order: stop leader tasks, then release the lease (another replica
+        // can lead at once), then write the event.
         if let Some(tx) = &self.local_leader {
             tx.send_modify(|s| s.leading = false);
         }
@@ -492,6 +520,13 @@ impl KubernetesRuntime {
         }
         if let Some(elector) = self.elector {
             elector.stop().await;
+        }
+        if let Some(events) = &self.events
+            && tokio::time::timeout(STOP_EVENT_TIMEOUT, events.emit(events::stopping()))
+                .await
+                .is_err()
+        {
+            tracing::debug!("kubernetes: Stopping event timed out");
         }
         self.cancel.cancel();
         for handle in self.watches {
@@ -537,13 +572,71 @@ impl Plugin for KubernetesPlugin {
                     Ok(())
                 }
             })
-            .on_shutdown(move || {
-                let rt = stop.lock().unwrap_or_else(PoisonError::into_inner).take();
-                async move {
-                    if let Some(rt) = rt {
-                        rt.shutdown().await;
-                    }
-                }
+            .on_shutdown(move || shutdown_hook(&stop))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LeaderElectionConfig;
+
+    #[test]
+    fn task_stop_timeout_stays_below_the_takeover_gap() {
+        let le = LeaderElectionConfig::default();
+        // Gap 15 s - 10 s = 5 s. Timeout 4 s.
+        assert_eq!(task_stop_timeout(&le), Duration::from_secs(4));
+        let wide = LeaderElectionConfig {
+            lease_duration_secs: 60,
+            renew_deadline_secs: 10,
+            ..LeaderElectionConfig::default()
+        };
+        assert_eq!(task_stop_timeout(&wide), TASK_STOP_TIMEOUT, "capped");
+        let tight = LeaderElectionConfig {
+            lease_duration_secs: 3,
+            renew_deadline_secs: 2,
+            retry_period_secs: 1,
+            ..LeaderElectionConfig::default()
+        };
+        assert_eq!(task_stop_timeout(&tight), Duration::from_millis(800));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_hook_finishes_when_autumn_drops_it() {
+        let api = crate::api::MemoryKubeApi::new();
+        let mut cfg = KubernetesConfig::default();
+        cfg.leader_election.enabled = true;
+        cfg.leader_election.lease_name = "l".into();
+        let rt = KubernetesPlugin::with_config(cfg)
+            .with_api(api.clone())
+            .with_pod_info(PodInfo {
+                namespace: Some("ns".into()),
+                ..PodInfo::default()
             })
+            .start(&AppState::for_test())
+            .await
+            .unwrap();
+        assert!(rt.leadership().unwrap().wait_until_leader().await);
+        let slot = Mutex::new(Some(rt));
+        // Budget over: autumn drops the hook future before it runs.
+        drop(shutdown_hook(&slot));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(api.lease("ns", "l").unwrap().is_free(), "released anyway");
+        // A second call finds nothing to do.
+        shutdown_hook(&slot).await;
+    }
+
+    #[test]
+    fn identity_has_pod_name_and_suffix() {
+        let pod = PodInfo {
+            name: Some("web-1".into()),
+            ..PodInfo::default()
+        };
+        let id = default_identity(&pod);
+        assert!(
+            id.starts_with("web-1-") && id.len() == "web-1-".len() + 8,
+            "{id}"
+        );
+        assert_ne!(default_identity(&pod), default_identity(&pod));
     }
 }

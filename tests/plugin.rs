@@ -62,20 +62,12 @@ async fn plugin_installs_with_one_call() {
     assert!(ConfigMapStore::from_state(state).is_some());
     let lead = Leadership::from_state(state).unwrap();
     assert_eq!(lead.lease_name(), LEASE);
-    wait_until_real(|| lead.is_leader()).await;
+    // TestApp runs startup hooks on a runtime that ends after startup. The
+    // elector task ends with it, and a stopped elector never reads as leader.
+    assert!(!lead.is_leader());
     let body = client.get("/actuator/health").send().await.text();
     assert!(body.contains("kubernetes"), "{body}");
     assert!(body.contains("UP"), "{body}");
-}
-
-async fn wait_until_real(mut cond: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("condition not met in 5 s");
 }
 
 #[test]
@@ -404,6 +396,9 @@ async fn readiness_opt_in_gates_ready() {
         .plugin(plugin(&api, KubernetesConfig::default()).readiness(true))
         .build();
     gated.get("/ready").send().await.assert_status(503);
+    // Positive control: the same gate passes when the API answers.
+    api.set_down(false);
+    gated.get("/ready").send().await.assert_status(200);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -474,4 +469,31 @@ async fn lead_when_detached_runs_leader_tasks_locally() {
     rt.shutdown().await;
     assert!(!lead.is_leader());
     assert_eq!(running.load(Ordering::SeqCst), 0, "task stopped");
+}
+
+#[tokio::test(start_paused = true)]
+async fn losing_the_lease_writes_leader_lost() {
+    let api = MemoryKubeApi::new();
+    let rt = plugin(&api, config())
+        .start(&AppState::for_test())
+        .await
+        .unwrap();
+    let lead = rt.leadership().unwrap();
+    assert!(lead.wait_until_leader().await);
+    let mut intruder = api.lease(NS, LEASE).unwrap();
+    intruder.holder = Some("intruder".into());
+    api.put_lease(NS, LEASE, intruder);
+    lead.wait_until_follower().await;
+    wait_until(Duration::from_secs(5), || {
+        api.events().iter().any(|(_, e)| e.reason == "LeaderLost")
+    })
+    .await;
+    let lost = api
+        .events()
+        .into_iter()
+        .find(|(_, e)| e.reason == "LeaderLost")
+        .unwrap()
+        .1;
+    assert_eq!(lost.kind, autumn_plugin_kubernetes::api::EventKind::Warning);
+    rt.shutdown().await;
 }

@@ -23,6 +23,8 @@ struct State {
     events: Vec<(PodRef, PodEvent)>,
     lease_writes: u64,
     latency: std::time::Duration,
+    write_reply_delay: std::time::Duration,
+    conflicting_lease_writes: u32,
 }
 
 /// In-memory fake of the Kubernetes API. Clones share state.
@@ -116,6 +118,20 @@ impl MemoryKubeApi {
         self.lock().latency
     }
 
+    /// Lease writes land at once, but their reply waits this long.
+    pub fn set_write_reply_delay(&self, delay: std::time::Duration) {
+        self.lock().write_reply_delay = delay;
+    }
+
+    /// The next `n` Lease writes fail with a write conflict (HTTP 409).
+    pub fn conflict_lease_writes(&self, n: u32) {
+        self.lock().conflicting_lease_writes = n;
+    }
+
+    fn write_reply_delay(&self) -> std::time::Duration {
+        self.lock().write_reply_delay
+    }
+
     /// When `true`, event writes fail.
     pub fn set_events_failing(&self, failing: bool) {
         self.lock().events_failing = failing;
@@ -170,6 +186,12 @@ impl MemoryKubeApi {
         if s.failing_lease_writes > 0 {
             s.failing_lease_writes -= 1;
             return Err(KubeError::Api("injected lease write failure".to_owned()));
+        }
+        if s.conflicting_lease_writes > 0 {
+            s.conflicting_lease_writes -= 1;
+            return Err(KubeError::Conflict(
+                "injected lease write conflict".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -293,9 +315,12 @@ impl KubeApi for MemoryKubeApi {
         record: &'a LeaseRecord,
     ) -> ApiFuture<'a, LeaseRecord> {
         let latency = self.latency();
+        let reply = self.write_reply_delay();
         Box::pin(async move {
             wait(latency).await;
-            self.do_create(namespace, name, record)
+            let result = self.do_create(namespace, name, record);
+            wait(reply).await;
+            result
         })
     }
 
@@ -306,9 +331,12 @@ impl KubeApi for MemoryKubeApi {
         record: &'a LeaseRecord,
     ) -> ApiFuture<'a, LeaseRecord> {
         let latency = self.latency();
+        let reply = self.write_reply_delay();
         Box::pin(async move {
             wait(latency).await;
-            self.do_replace(namespace, name, record)
+            let result = self.do_replace(namespace, name, record);
+            wait(reply).await;
+            result
         })
     }
 

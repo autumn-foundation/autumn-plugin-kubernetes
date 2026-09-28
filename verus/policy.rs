@@ -108,14 +108,17 @@ pub fn decide(holder_is_me: bool, holder_empty: bool, observed_age_ms: u64, dura
 }
 
 /// The lease duration to use for expiry. The record value wins when it is
-/// positive. Else the local config value.
+/// positive, up to `MAX_LEASE_MS`. Else the local config value. The cap stops
+/// a foreign writer from holding the lease for years.
 pub fn effective_duration_ms(record_secs: i32, fallback_ms: u64) -> (r: u64)
     ensures
-        record_secs > 0 ==> r == (record_secs as int) * 1000,
+        record_secs > 0 ==> r == spec_min((record_secs as int) * 1000, MAX_LEASE_MS as int),
+        record_secs > 0 ==> r <= MAX_LEASE_MS,
         record_secs <= 0 ==> r == fallback_ms,
 {
     if record_secs > 0 {
-        (record_secs as u64) * 1000
+        let ms = (record_secs as u64) * 1000;
+        if ms < MAX_LEASE_MS { ms } else { MAX_LEASE_MS }
     } else {
         fallback_ms
     }

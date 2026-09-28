@@ -30,10 +30,56 @@ use crate::policy::{self, Action};
 /// What this replica knows about the lease.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LeaderState {
-    /// `true` while this replica believes it leads.
+    /// `true` while this replica believes it leads, up to `valid_until`.
     pub leading: bool,
     /// The last holder seen. `None` when free or not read yet.
     pub holder: Option<String>,
+    /// Belief stops at this time, also when the elector cannot run.
+    /// `None`: no time limit (detached local leader).
+    pub valid_until: Option<Instant>,
+}
+
+impl LeaderState {
+    /// Returns `true` when this state says "leading" at time `now`.
+    #[must_use]
+    pub fn leading_at(&self, now: Instant) -> bool {
+        self.leading && self.valid_until.is_none_or(|until| now < until)
+    }
+}
+
+/// Waits until the state is "leading" now. Returns `false` when the elector
+/// stops.
+async fn wait_leading(rx: &mut watch::Receiver<LeaderState>) -> bool {
+    loop {
+        if rx.has_changed().is_err() {
+            return false;
+        }
+        if rx.borrow_and_update().leading_at(Instant::now()) {
+            return true;
+        }
+        if rx.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
+/// Waits until the state is not "leading": the flag goes off, the deadline
+/// passes, or the elector stops.
+async fn wait_not_leading(rx: &mut watch::Receiver<LeaderState>) {
+    loop {
+        if rx.has_changed().is_err() {
+            return;
+        }
+        let state = rx.borrow_and_update().clone();
+        if !state.leading_at(Instant::now()) {
+            return;
+        }
+        tokio::select! {
+            biased;
+            r = rx.changed() => if r.is_err() { return },
+            () = sleep_until_opt(state.valid_until) => {}
+        }
+    }
 }
 
 /// A read handle on the election. Clones share state.
@@ -45,11 +91,12 @@ pub struct Leadership {
 }
 
 impl Leadership {
-    /// Returns `true` while this replica believes it leads. `false` when the
-    /// elector has stopped (for example after a panic).
+    /// Returns `true` while this replica believes it leads. It reads the
+    /// belief deadline on the caller's clock, so a starved elector cannot
+    /// leave a stale "leading". `false` when the elector has stopped.
     #[must_use]
     pub fn is_leader(&self) -> bool {
-        self.rx.has_changed().is_ok() && self.rx.borrow().leading
+        self.rx.has_changed().is_ok() && self.rx.borrow().leading_at(Instant::now())
     }
 
     /// This replica's holder identity.
@@ -79,16 +126,13 @@ impl Leadership {
     /// Waits until this replica leads. Returns `false` if the elector stops
     /// first.
     pub async fn wait_until_leader(&self) -> bool {
-        let mut rx = self.rx.clone();
-        rx.wait_for(|s| s.leading).await.is_ok() && self.is_leader()
+        wait_leading(&mut self.rx.clone()).await
     }
 
     /// Waits until this replica does not lead. Returns at once when it does
     /// not lead now.
     pub async fn wait_until_follower(&self) {
-        let mut rx = self.rx.clone();
-        // A closed channel means the elector stopped: not leading.
-        let _ = rx.wait_for(|s| !s.leading).await;
+        wait_not_leading(&mut self.rx.clone()).await;
     }
 
     /// Reads the handle from the app state. `None` when leader election is
@@ -108,6 +152,7 @@ pub(crate) fn local_leader(
     let (tx, rx) = watch::channel(LeaderState {
         leading: true,
         holder: Some(identity.to_owned()),
+        valid_until: None,
     });
     let leadership = Leadership {
         identity: Arc::from(identity),
@@ -207,6 +252,7 @@ impl LeaderElector {
             sent_ok: None,
             holder_is_me: false,
             ever_won: false,
+            failing: false,
             last_holder: None,
             tx,
             elector: self,
@@ -215,7 +261,7 @@ impl LeaderElector {
         ElectorHandle {
             leadership,
             cancel,
-            task,
+            task: Some(task),
         }
     }
 }
@@ -247,6 +293,8 @@ struct Loop {
     holder_is_me: bool,
     /// A write was good at least once. Release only then.
     ever_won: bool,
+    /// The last call failed. Warn once per failure run.
+    failing: bool,
     last_holder: Option<String>,
 }
 
@@ -287,15 +335,18 @@ impl Loop {
     /// Sends the current state. Counts and reports each edge.
     fn publish(&self, stopping: bool) {
         let leading = self.leading_now();
+        let valid_until = self.belief_deadline();
         let holder = self.last_holder.clone();
         let mut edge = None;
         self.tx.send_if_modified(|st| {
             if st.leading != leading {
                 edge = Some(leading);
             }
-            let changed = st.leading != leading || st.holder != holder;
+            let changed =
+                st.leading != leading || st.holder != holder || st.valid_until != valid_until;
             st.leading = leading;
             st.holder.clone_from(&holder);
+            st.valid_until = valid_until;
             changed
         });
         let Some(now_leading) = edge else {
@@ -404,7 +455,21 @@ impl Loop {
             // Another writer won. Do not trust the old holder view.
             self.holder_is_me = false;
         }
-        tracing::debug!(lease = %self.elector.config.lease_name, error = %err, "kubernetes: lease call failed");
+        let lease = &self.elector.config.lease_name;
+        if self.failing {
+            tracing::debug!(lease = %lease, error = %err, "kubernetes: lease call failed");
+        } else {
+            // Warn once per failure run. The count is in the metrics.
+            tracing::warn!(lease = %lease, class = err.class(), error = %err, "kubernetes: lease call failed");
+            self.failing = true;
+        }
+    }
+
+    fn succeeded(&mut self) {
+        if self.failing {
+            tracing::info!(lease = %self.elector.config.lease_name, "kubernetes: lease calls work again");
+            self.failing = false;
+        }
     }
 
     async fn run(mut self, cancel: CancellationToken) {
@@ -418,7 +483,8 @@ impl Loop {
                 () = sleep_until_opt(deadline) => None,
             };
             match outcome {
-                Some(Ok(Ok(()))) | None => {}
+                Some(Ok(Ok(()))) => self.succeeded(),
+                None => {}
                 Some(Ok(Err(e))) => self.failed(&e),
                 Some(Err(_)) => self.failed(&KubeError::Api("lease call timed out".to_owned())),
             }
@@ -484,12 +550,19 @@ async fn sleep_until_opt(at: Option<Instant>) {
     }
 }
 
-/// A running elector.
+/// A running elector. A drop stops it like [`ElectorHandle::stop`], in the
+/// background.
 #[derive(Debug)]
 pub struct ElectorHandle {
     leadership: Leadership,
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Drop for ElectorHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl ElectorHandle {
@@ -501,17 +574,21 @@ impl ElectorHandle {
 
     /// Stops the loop. Belief ends first. Then, with `release_on_shutdown`,
     /// the lease is cleared so another replica takes over at once.
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         self.cancel.cancel();
-        if let Err(e) = self.task.await {
+        if let Some(task) = self.task.take()
+            && let Err(e) = task.await
+        {
             tracing::warn!(error = %e, "kubernetes: elector task ended with an error");
         }
     }
 
     /// Stops the loop like a crash: no release. For failover tests. This
     /// handle then shows "not leading", as a dead process believes nothing.
-    pub fn abort(self) {
-        self.task.abort();
+    pub fn abort(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -557,11 +634,17 @@ impl LeaderTask {
     }
 }
 
-/// Runs leader tasks for each term.
+/// Runs leader tasks for each term. A drop cancels the running tasks.
 #[derive(Debug)]
 pub struct LeaderTasks {
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Drop for LeaderTasks {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl LeaderTasks {
@@ -582,13 +665,19 @@ impl LeaderTasks {
             stop_timeout,
             cancel.clone(),
         ));
-        Self { cancel, task }
+        Self {
+            cancel,
+            task: Some(task),
+        }
     }
 
     /// Cancels running tasks, waits for them, and stops.
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         self.cancel.cancel();
-        if let Err(e) = self.task.await {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        if let Err(e) = task.await {
             tracing::warn!(error = %e, "kubernetes: leader task supervisor ended with an error");
         }
     }
@@ -606,7 +695,7 @@ async fn supervise(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            r = rx.wait_for(|s| s.leading) => if r.is_err() { return },
+            leading = wait_leading(&mut rx) => if !leading { return },
         }
         let term = cancel.child_token();
         let handles: Vec<(String, JoinHandle<()>)> = tasks
@@ -622,20 +711,25 @@ async fn supervise(
         tokio::select! {
             biased;
             () = cancel.cancelled() => {}
-            _ = rx.wait_for(|s| !s.leading) => {}
+            () = wait_not_leading(&mut rx) => {}
         }
         term.cancel();
-        let deadline = Instant::now() + stop_timeout;
+        let deadline = Instant::now().checked_add(stop_timeout);
         for (name, mut handle) in handles {
-            if tokio::time::timeout_at(deadline, &mut handle)
-                .await
-                .is_err()
-            {
+            let done = if let Some(at) = deadline {
+                tokio::time::timeout_at(at, &mut handle).await.is_ok()
+            } else {
+                let _ = (&mut handle).await;
+                true
+            };
+            if !done {
                 tracing::warn!(task = %name, "kubernetes: leader task did not stop in time; aborted");
                 handle.abort();
+                // Wait for the abort, so no old task runs in the next term.
+                let _ = handle.await;
             }
         }
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || rx.has_changed().is_err() {
             return;
         }
     }
