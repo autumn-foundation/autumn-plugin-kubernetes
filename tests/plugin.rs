@@ -374,7 +374,10 @@ async fn health_and_metrics_report_state() {
     assert_eq!(out.status, HealthStatus::Up);
     assert_eq!(out.details["leader"]["leading"], true);
     api.set_down(true);
+    // The result is reused for a short time. Then the check sees the outage.
+    tokio::time::sleep(autumn_plugin_kubernetes::health::UP_TTL).await;
     assert_eq!(h.check().await.status, HealthStatus::Down);
+    assert_eq!(rt.metrics().snapshot().api_up, 0);
     api.set_down(false);
     let names: Vec<String> = rt.metrics().collect().into_iter().map(|f| f.name).collect();
     assert!(names.contains(&"kubernetes_leader".to_owned()), "{names:?}");
@@ -396,8 +399,10 @@ async fn readiness_opt_in_gates_ready() {
         .plugin(plugin(&api, KubernetesConfig::default()).readiness(true))
         .build();
     gated.get("/ready").send().await.assert_status(503);
-    // Positive control: the same gate passes when the API answers.
+    // Positive control: the same gate passes when the API answers (after
+    // the short reuse time of a failed result).
     api.set_down(false);
+    tokio::time::sleep(autumn_plugin_kubernetes::health::DOWN_TTL).await;
     gated.get("/ready").send().await.assert_status(200);
 }
 

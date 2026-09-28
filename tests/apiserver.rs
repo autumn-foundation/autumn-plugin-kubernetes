@@ -414,7 +414,9 @@ async fn plugin_health_on_real_server() {
     .unwrap();
     let out = rt.health().check().await;
     assert_eq!(out.status, HealthStatus::Up);
-    assert!(out.details["version"].as_str().unwrap().starts_with("v1."));
+    assert_eq!(out.details["mode"], "custom");
+    assert!(!out.details.contains_key("version"));
+    assert_eq!(rt.metrics().snapshot().api_up, 1, "background refresh");
     assert_eq!(rt.namespace(), Some("default"), "kubeconfig namespace");
     rt.shutdown().await;
 }

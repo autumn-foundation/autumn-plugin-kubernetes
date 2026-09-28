@@ -312,6 +312,12 @@ impl KubernetesPlugin {
             leadership: leadership.clone(),
             config_maps: config_maps.clone(),
         });
+        // Keep `kubernetes_api_up` current with no health requests.
+        let mut watches = watches;
+        watches.push(tokio::spawn(refresh_health(
+            Arc::clone(&health),
+            cancel.clone(),
+        )));
         events.spawn(events::started(mode));
         tracing::info!(mode, namespace = %namespace, role = role.as_str(), "kubernetes plugin started");
         Ok(KubernetesRuntime {
@@ -400,6 +406,18 @@ impl KubernetesPlugin {
             health,
             leadership,
             config_maps: None,
+        }
+    }
+}
+
+/// Checks the API server every [`crate::health::UP_TTL`] until `cancel`.
+async fn refresh_health(health: Arc<KubernetesHealth>, cancel: CancellationToken) {
+    loop {
+        health.refresh().await;
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(crate::health::UP_TTL) => {}
         }
     }
 }

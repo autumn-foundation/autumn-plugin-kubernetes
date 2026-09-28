@@ -3,12 +3,18 @@
 //! Status: `Up` when the API server answers `GET /version` in 1.5 s, or when
 //! the plugin runs detached (no cluster). `Down` when the check fails.
 //! `Unknown` before startup. Details have the mode, namespace, leader state,
-//! and ConfigMap sync state. They have no URLs, tokens, or error text: only
-//! a short error class.
+//! and ConfigMap sync state. They have no URLs, tokens, versions, pod names,
+//! or error text: only a short error class.
+//!
+//! Results are reused (`UP_TTL`, `DOWN_TTL`), so health requests do not load
+//! the API server. The runtime also refreshes in the background, so the
+//! `kubernetes_api_up` metric stays current with no health requests.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus, IndicatorGroup};
 use futures::future::BoxFuture;
@@ -21,6 +27,11 @@ use crate::metrics::KubernetesMetrics;
 
 /// Time limit for the API check. It is under the 2 s indicator timeout.
 pub const CHECK_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// How long an `Up` result is reused. Health requests do not reach the API
+/// server more often than this.
+pub const UP_TTL: Duration = Duration::from_secs(5);
+/// How long a failed result is reused. Short, so recovery shows fast.
+pub const DOWN_TTL: Duration = Duration::from_secs(1);
 
 /// What the indicator checks. Set once at startup.
 pub(crate) struct HealthTarget {
@@ -38,6 +49,8 @@ pub struct KubernetesHealth {
     target: OnceLock<HealthTarget>,
     readiness: bool,
     metrics: Arc<KubernetesMetrics>,
+    /// Last API check: when, and the error class if it failed.
+    cache: tokio::sync::Mutex<Option<(Instant, Result<(), &'static str>)>>,
 }
 
 impl std::fmt::Debug for KubernetesHealth {
@@ -55,7 +68,45 @@ impl KubernetesHealth {
             target: OnceLock::new(),
             readiness,
             metrics,
+            cache: tokio::sync::Mutex::const_new(None),
         }
+    }
+
+    /// Checks the API server now and stores the result. The runtime calls it
+    /// in the background.
+    pub(crate) async fn refresh(&self) {
+        let mut cache = self.cache.lock().await;
+        let result = self.probe().await;
+        *cache = Some((Instant::now(), result));
+    }
+
+    /// One `GET /version`. Sets the metric.
+    async fn probe(&self) -> Result<(), &'static str> {
+        let Some(api) = self.target.get().and_then(|t| t.api.as_ref()) else {
+            return Ok(());
+        };
+        let result = match tokio::time::timeout(CHECK_TIMEOUT, api.server_version()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.class()),
+            Err(_) => Err("timeout"),
+        };
+        self.metrics.set_api_up(result.is_ok());
+        result
+    }
+
+    /// The cached result, or a new check when the cached one is old. One
+    /// check at a time.
+    async fn api_status(&self) -> Result<(), &'static str> {
+        let mut cache = self.cache.lock().await;
+        if let Some((at, result)) = *cache {
+            let ttl = if result.is_ok() { UP_TTL } else { DOWN_TTL };
+            if at.elapsed() < ttl {
+                return result;
+            }
+        }
+        let result = self.probe().await;
+        *cache = Some((Instant::now(), result));
+        result
     }
 
     /// Sets the target once. Later calls do nothing.
@@ -81,7 +132,6 @@ impl KubernetesHealth {
                 json!({
                     "lease": lead.lease_name(),
                     "leading": lead.is_leader(),
-                    "holder": lead.holder(),
                 }),
             );
         }
@@ -102,27 +152,19 @@ impl KubernetesHealth {
                 .collect();
             details.insert("config_maps".to_owned(), Value::Object(maps));
         }
-        let Some(api) = &target.api else {
+        if target.api.is_none() {
             return HealthCheckOutput {
                 status: HealthStatus::Up,
                 details,
             };
-        };
-        let status = match tokio::time::timeout(CHECK_TIMEOUT, api.server_version()).await {
-            Ok(Ok(version)) => {
-                details.insert("version".to_owned(), json!(version));
-                HealthStatus::Up
-            }
-            Ok(Err(e)) => {
-                details.insert("error".to_owned(), json!(e.class()));
-                HealthStatus::Down
-            }
-            Err(_) => {
-                details.insert("error".to_owned(), json!("timeout"));
+        }
+        let status = match self.api_status().await {
+            Ok(()) => HealthStatus::Up,
+            Err(class) => {
+                details.insert("error".to_owned(), json!(class));
                 HealthStatus::Down
             }
         };
-        self.metrics.set_api_up(status == HealthStatus::Up);
         HealthCheckOutput { status, details }
     }
 }
@@ -180,7 +222,7 @@ mod tests {
         assert_eq!(m.snapshot().api_up, -1, "no check, no gauge");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn api_up_and_down() {
         let api = MemoryKubeApi::new();
         let (h, m) = health(false);
@@ -189,9 +231,13 @@ mod tests {
         assert_eq!(out.status, HealthStatus::Up);
         assert_eq!(out.details["mode"], json!("in_cluster"));
         assert_eq!(out.details["namespace"], json!("shop"));
-        assert_eq!(out.details["version"], json!("v1.34.0-memory"));
+        assert!(
+            !out.details.contains_key("version"),
+            "no server version in output"
+        );
         assert_eq!(m.snapshot().api_up, 1);
         api.set_down(true);
+        tokio::time::sleep(UP_TTL).await;
         let out = h.check().await;
         assert_eq!(out.status, HealthStatus::Down);
         assert_eq!(out.details["error"], json!("api"));
@@ -237,9 +283,52 @@ mod tests {
         let out = h.check().await;
         assert_eq!(out.details["leader"]["lease"], json!("l"));
         assert_eq!(out.details["leader"]["leading"], json!(true));
-        assert_eq!(out.details["leader"]["holder"], json!("me"));
+        assert!(
+            out.details["leader"].get("holder").is_none(),
+            "no pod names in output"
+        );
         assert_eq!(out.details["config_maps"]["flags"], json!("waiting"));
         elector.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn results_are_cached_so_requests_do_not_hit_the_api() {
+        let api = MemoryKubeApi::new();
+        let (h, _) = health(false);
+        h.set(target(Some(Arc::new(api.clone())), "in_cluster"));
+        assert_eq!(h.check().await.status, HealthStatus::Up);
+        api.set_down(true);
+        assert_eq!(
+            h.check().await.status,
+            HealthStatus::Up,
+            "cached for UP_TTL"
+        );
+        tokio::time::sleep(UP_TTL).await;
+        assert_eq!(h.check().await.status, HealthStatus::Down);
+        api.set_down(false);
+        assert_eq!(
+            h.check().await.status,
+            HealthStatus::Down,
+            "cached for DOWN_TTL"
+        );
+        tokio::time::sleep(DOWN_TTL).await;
+        assert_eq!(
+            h.check().await.status,
+            HealthStatus::Up,
+            "failures are cached briefly"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_updates_the_metric_without_requests() {
+        let api = MemoryKubeApi::new();
+        let (h, m) = health(false);
+        h.set(target(Some(Arc::new(api.clone())), "in_cluster"));
+        h.refresh().await;
+        assert_eq!(m.snapshot().api_up, 1);
+        api.set_down(true);
+        h.refresh().await;
+        assert_eq!(m.snapshot().api_up, 0);
     }
 
     #[test]

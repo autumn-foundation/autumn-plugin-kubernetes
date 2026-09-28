@@ -141,6 +141,8 @@ pub(crate) fn spawn_watch(
 ) -> JoinHandle<()> {
     metrics.watch_config_map(&name);
     tokio::spawn(async move {
+        // Warn once per failure run; the count is in the metrics.
+        let mut failing = false;
         loop {
             let mut stream = api.watch_config_map(&namespace, &name);
             loop {
@@ -151,12 +153,21 @@ pub(crate) fn spawn_watch(
                 };
                 match item {
                     Some(Ok(event)) => {
+                        if failing {
+                            tracing::info!(config_map = %name, "kubernetes: ConfigMap watch works again");
+                            failing = false;
+                        }
                         store.apply(&name, event);
                         metrics.config_map(&name, true);
                     }
                     Some(Err(e)) => {
                         metrics.config_map(&name, false);
-                        tracing::warn!(config_map = %name, error = %e, "kubernetes: ConfigMap watch error");
+                        if failing {
+                            tracing::debug!(config_map = %name, error = %e, "kubernetes: ConfigMap watch error");
+                        } else {
+                            tracing::warn!(config_map = %name, class = e.class(), error = %e, "kubernetes: ConfigMap watch error");
+                            failing = true;
+                        }
                     }
                     None => break,
                 }
