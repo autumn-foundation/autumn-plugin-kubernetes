@@ -7,6 +7,7 @@ pub mod error;
 mod events;
 pub mod health;
 pub mod leader;
+pub mod manifest;
 pub mod metrics;
 pub mod pod;
 pub mod policy;

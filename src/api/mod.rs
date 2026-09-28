@@ -5,6 +5,7 @@
 //! tests. It follows the same rules as the API server.
 
 mod client;
+pub use client::REPORTER;
 mod memory;
 
 use std::collections::BTreeMap;
