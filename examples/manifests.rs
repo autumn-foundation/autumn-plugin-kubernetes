@@ -2,23 +2,36 @@
 //!
 //! `cargo run --example manifests -- <name> <image> [namespace]`
 //!
-//! It reads `[kubernetes]` from `autumn.toml` (leader election, ConfigMaps,
-//! events) so the Role has the right verbs.
+//! It loads the app config like autumn-web: `autumn.toml`, the profile
+//! (`AUTUMN_ENV`, `AUTUMN_PROFILE`, or `--profile`), `autumn-<profile>.toml`,
+//! `.env`, and env vars. So probes, ports, grace period, and the Role match
+//! the app.
 
 use autumn_plugin_kubernetes::KubernetesConfig;
 use autumn_plugin_kubernetes::manifest::ManifestSpec;
 use autumn_web::config::AutumnConfig;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let (Some(name), Some(image)) = (args.next(), args.next()) else {
-        eprintln!("usage: manifests <name> <image> [namespace]");
+    // Positional args. `--profile <name>` and `--profile=<name>` are for
+    // autumn's config loader, so skip them here.
+    let mut args: Vec<String> = Vec::new();
+    let mut raw = std::env::args().skip(1);
+    while let Some(a) = raw.next() {
+        if a == "--profile" {
+            raw.next();
+        } else if !a.starts_with("--profile=") {
+            args.push(a);
+        }
+    }
+    let (Some(name), Some(image)) = (args.first(), args.get(1)) else {
+        eprintln!("usage: manifests <name> <image> [namespace] [--profile <name>]");
         std::process::exit(2);
     };
-    let kube = KubernetesConfig::load(None)?;
-    let mut spec = ManifestSpec::from_config(name, image, &AutumnConfig::default(), &kube);
-    if let Some(ns) = args.next() {
-        spec.namespace = ns;
+    let autumn = AutumnConfig::load_lenient_unknown_roots()?;
+    let kube = KubernetesConfig::load(autumn.profile_name())?;
+    let mut spec = ManifestSpec::from_config(name.as_str(), image.as_str(), &autumn, &kube);
+    if let Some(ns) = args.get(2) {
+        spec.namespace.clone_from(ns);
     }
     print!("{}", spec.render_yaml()?);
     Ok(())

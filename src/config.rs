@@ -2,11 +2,19 @@
 //!
 //! Layers, from low to high:
 //! 1. `autumn.toml` `[kubernetes]`.
-//! 2. `autumn.toml` `[profile.<name>.kubernetes]`.
+//! 2. `autumn.toml` `[profile.<name>.kubernetes]`. For `prod`, the
+//!    `production` section applies first, then `prod` (like autumn-web).
 //! 3. `autumn-<profile>.toml` `[kubernetes]`.
-//! 4. Env vars: `AUTUMN_KUBERNETES__<PATH>`, for example
+//! 4. `.env` values, then env vars: `AUTUMN_KUBERNETES__<PATH>`, for example
 //!    `AUTUMN_KUBERNETES__LEADER_ELECTION__ENABLED=true`. A list is comma
 //!    separated.
+//!
+//! Files: each file is read from `$AUTUMN_MANIFEST_DIR` if it is there,
+//! else from the working directory (like autumn-web).
+//!
+//! With `server.strict_config`, autumn 0.7 accepts `[kubernetes]` only at the
+//! top level. Put profile values in `autumn-<profile>.toml`, not in
+//! `[profile.<name>.kubernetes]`.
 
 use std::path::Path;
 
@@ -215,6 +223,50 @@ fn apply_env(
     Ok(())
 }
 
+/// `dir/file` if it exists, else `file` in the working directory. autumn-web
+/// does the same, so a build path baked into the binary does not hide files.
+pub(crate) fn find_file(dir: &Path, file: &str) -> std::path::PathBuf {
+    let candidate = dir.join(file);
+    if candidate.exists() {
+        candidate
+    } else {
+        std::path::PathBuf::from(file)
+    }
+}
+
+/// The value of `--profile <name>` or `--profile=<name>` in the process args.
+fn profile_flag() -> Option<String> {
+    let args: Vec<String> = std::env::args_os()
+        .filter_map(|a| a.into_string().ok())
+        .collect();
+    profile_flag_in(&args)
+}
+
+fn profile_flag_in(args: &[String]) -> Option<String> {
+    args.iter()
+        .enumerate()
+        .find_map(|(i, a)| {
+            a.strip_prefix("--profile=").map(str::to_owned).or_else(|| {
+                (a == "--profile")
+                    .then(|| args.get(i + 1).cloned())
+                    .flatten()
+            })
+        })
+        // Like autumn-web: an empty value selects nothing.
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// Inline `[profile.<name>]` merge order of autumn-web: the long alias first,
+/// so the short name wins.
+fn inline_profile_order(profile_names: &[String]) -> Vec<String> {
+    let mut names = profile_names.to_vec();
+    names.sort_by_key(|n| match n.as_str() {
+        "production" | "development" => 0,
+        _ => 1,
+    });
+    names
+}
+
 fn read_optional(path: &Path) -> Result<Option<String>, KubeError> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -243,16 +295,31 @@ impl KubernetesConfig {
         profile_file: Option<&str>,
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, KubeError> {
+        let inline: Vec<String> = profile.map(str::to_owned).into_iter().collect();
+        Self::from_layers(base, &inline, profile_file, env)
+    }
+
+    /// Like [`Self::from_sources`], with several inline profile sections
+    /// merged in order (the last wins).
+    ///
+    /// # Errors
+    /// Same as [`Self::from_sources`].
+    pub fn from_layers(
+        base: Option<&str>,
+        inline_profiles: &[String],
+        profile_file: Option<&str>,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, KubeError> {
         let mut merged = toml::Table::new();
         if let Some(text) = base {
             let base = parse_toml(text, "autumn.toml")?;
             if let Some(t) = section(&base, &[SECTION]) {
                 merge(&mut merged, t);
             }
-            if let Some(name) = profile
-                && let Some(t) = section(&base, &["profile", name, SECTION])
-            {
-                merge(&mut merged, t);
+            for name in inline_profiles {
+                if let Some(t) = section(&base, &["profile", name, SECTION]) {
+                    merge(&mut merged, t);
+                }
             }
         }
         if let Some(text) = profile_file {
@@ -286,25 +353,17 @@ impl KubernetesConfig {
         profile_names: &[String],
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, KubeError> {
-        let base = read_optional(&dir.join("autumn.toml"))?;
+        let base = read_optional(&find_file(dir, "autumn.toml"))?;
         let mut profile_file = None;
         for name in profile_names {
-            if let Some(text) = read_optional(&dir.join(format!("autumn-{name}.toml")))? {
+            if let Some(text) = read_optional(&find_file(dir, &format!("autumn-{name}.toml")))? {
                 profile_file = Some(text);
                 break;
             }
         }
-        // Inline `[profile.<name>]`: the first name that has a section wins.
-        let inline = base.as_deref().and_then(|text| {
-            let table = text.parse::<toml::Table>().ok()?;
-            profile_names
-                .iter()
-                .find(|n| section(&table, &["profile", n, SECTION]).is_some())
-                .cloned()
-        });
-        Self::from_sources(
+        Self::from_layers(
             base.as_deref(),
-            inline.as_deref(),
+            &inline_profile_order(profile_names),
             profile_file.as_deref(),
             env,
         )
@@ -324,6 +383,7 @@ impl KubernetesConfig {
                 let selector = ["AUTUMN_ENV", "AUTUMN_PROFILE"]
                     .iter()
                     .find_map(|k| os.var(k).ok().filter(|v| !v.trim().is_empty()))
+                    .or_else(profile_flag)
                     .map_or_else(|| p.to_owned(), |v| v.trim().to_owned());
                 autumn_web::config::profile_override_file_lookup_names(p, &selector)
             })
@@ -331,9 +391,14 @@ impl KubernetesConfig {
         let dir = os
             .var("AUTUMN_MANIFEST_DIR")
             .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from);
-        let env = std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .filter(|(k, _)| k.starts_with(ENV_PREFIX));
+        // `.env` first, then the process env, so the process env wins.
+        let mut env = autumn_web::dotenv::resolve_process_dotenv()
+            .map_err(|e| config_err(format!(".env: {e}")))?;
+        env.extend(
+            std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+        );
+        let env = env.into_iter().filter(|(k, _)| k.starts_with(ENV_PREFIX));
         Self::load_from_dir(&dir, &names, env)
     }
 
@@ -691,6 +756,51 @@ mod tests {
         assert!(!is_dns_subdomain("A"));
         assert!(!is_dns_subdomain(&"a".repeat(254)));
         assert!(is_dns_subdomain(&"a".repeat(63)));
+    }
+
+    #[test]
+    fn inline_profiles_merge_long_alias_first() {
+        let base = r#"
+            [profile.production.kubernetes]
+            events = false
+            namespace = "long"
+            [profile.prod.kubernetes]
+            namespace = "short"
+        "#;
+        let names = inline_profile_order(&["prod".to_owned(), "production".to_owned()]);
+        assert_eq!(names, vec!["production", "prod"]);
+        let c = KubernetesConfig::from_layers(Some(base), &names, None, env(&[])).unwrap();
+        assert!(!c.events, "production applies");
+        assert_eq!(c.namespace, "short", "prod wins");
+    }
+
+    #[test]
+    fn profile_flag_forms() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            profile_flag_in(&a(&["app", "--profile", "prod"])).as_deref(),
+            Some("prod")
+        );
+        assert_eq!(
+            profile_flag_in(&a(&["app", "--profile=dev"])).as_deref(),
+            Some("dev")
+        );
+        assert_eq!(profile_flag_in(&a(&["app", "--profile="])), None);
+        assert_eq!(profile_flag_in(&a(&["app", "--profile"])), None);
+        assert_eq!(profile_flag_in(&a(&["app"])), None);
+    }
+
+    #[test]
+    fn find_file_falls_back_to_the_working_directory() {
+        let dir = std::env::temp_dir().join(format!("akp-find-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("autumn.toml"), "").unwrap();
+        assert_eq!(find_file(&dir, "autumn.toml"), dir.join("autumn.toml"));
+        assert_eq!(
+            find_file(&dir, "autumn-prod.toml"),
+            std::path::PathBuf::from("autumn-prod.toml")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

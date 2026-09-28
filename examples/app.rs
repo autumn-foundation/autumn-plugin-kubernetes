@@ -1,23 +1,20 @@
 //! Example app: pod info, a leader task, and a live ConfigMap.
 //!
-//! In a cluster, apply the output of `cargo run --example manifests`. On a
-//! laptop with no cluster, the plugin runs detached. Then:
-//! `cargo run --example app`
+//! `cargo run --example app`, then open `/whoami`, `/flags/beta`, and
+//! `/actuator/health`.
 //!
-//! `autumn.toml`:
-//!
-//! ```toml
-//! [kubernetes.leader_election]
-//! enabled = true
-//! lease_name = "example-leader"
-//!
-//! [kubernetes.config_maps]
-//! watch = ["example-flags"]
-//! ```
+//! The config is in code, so the example runs with no `autumn.toml`. With no
+//! cluster, the plugin runs detached and, for this demo, acts as leader
+//! (`lead_when_detached`). In a cluster, apply the output of
+//! `cargo run --example manifests -- example <image>`. A real app uses
+//! `KubernetesPlugin::new()` and the `[kubernetes]` section instead.
 
 use std::time::Duration;
 
-use autumn_plugin_kubernetes::{ConfigMapStore, KubernetesPlugin, LeaderTask, Leadership, PodInfo};
+use autumn_plugin_kubernetes::config::{ConfigMapsConfig, LeaderElectionConfig};
+use autumn_plugin_kubernetes::{
+    ConfigMapStore, KubernetesConfig, KubernetesPlugin, LeaderTask, Leadership, PodInfo,
+};
 use autumn_web::AppState;
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::extract::State;
@@ -59,9 +56,23 @@ async fn report(_state: AppState, cancel: CancellationToken) {
 
 #[autumn_web::main]
 async fn main() {
+    let config = KubernetesConfig {
+        leader_election: LeaderElectionConfig {
+            enabled: true,
+            lease_name: "example-leader".to_owned(),
+            lead_when_detached: true,
+            ..LeaderElectionConfig::default()
+        },
+        config_maps: ConfigMapsConfig {
+            watch: vec!["example-flags".to_owned()],
+        },
+        ..KubernetesConfig::default()
+    };
     autumn_web::app()
         .routes(routes![whoami, beta])
-        .plugin(KubernetesPlugin::new().leader_task(LeaderTask::new("report", report)))
+        .plugin(
+            KubernetesPlugin::with_config(config).leader_task(LeaderTask::new("report", report)),
+        )
         .run()
         .await;
 }
