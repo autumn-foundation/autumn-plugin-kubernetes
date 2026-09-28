@@ -5,6 +5,7 @@ pub mod config;
 pub mod configmap;
 pub mod error;
 mod events;
+pub mod health;
 pub mod leader;
 pub mod metrics;
 pub mod pod;
