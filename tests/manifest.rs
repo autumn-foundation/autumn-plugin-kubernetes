@@ -1,5 +1,11 @@
 //! Manifest generator (AC11).
-#![allow(missing_docs, clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::similar_names
+)]
 
 use autumn_plugin_kubernetes::KubernetesConfig;
 use autumn_plugin_kubernetes::manifest::ManifestSpec;
@@ -286,14 +292,14 @@ fn bad_specs_are_rejected() {
     bad(|s| s.lease_name = Some("Bad".into()), "lease");
     bad(|s| s.config_maps = vec!["x_y".into()], "config map");
     bad(
-        |s| s.env.insert("1BAD".into(), "v".into()).map_or((), |_| ()),
+        |s| {
+            s.env.insert("1BAD".into(), "v".into());
+        },
         "env",
     );
     bad(
         |s| {
-            s.env
-                .insert("POD_NAME".into(), "v".into())
-                .map_or((), |_| ())
+            s.env.insert("POD_NAME".into(), "v".into());
         },
         "POD_NAME",
     );

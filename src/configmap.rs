@@ -109,17 +109,17 @@ impl ConfigMapStore {
 
     /// Applies one watch event. Unknown names are ignored.
     pub fn apply(&self, name: &str, event: ConfigMapEvent) {
-        {
-            let mut maps = self.maps.write().unwrap_or_else(PoisonError::into_inner);
-            let Some(entry) = maps.get_mut(name) else {
-                return;
-            };
-            entry.synced = true;
-            entry.data = match event {
-                ConfigMapEvent::Applied(data) => Some(Arc::new(data)),
-                ConfigMapEvent::Deleted => None,
-            };
-        }
+        let data = match event {
+            ConfigMapEvent::Applied(data) => Some(Arc::new(data)),
+            ConfigMapEvent::Deleted => None,
+        };
+        let mut maps = self.maps.write().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = maps.get_mut(name) else {
+            return;
+        };
+        entry.synced = true;
+        entry.data = data;
+        drop(maps);
         self.generation.send_modify(|g| *g = g.wrapping_add(1));
     }
 

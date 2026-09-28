@@ -1,5 +1,11 @@
 //! Leader election and leader tasks on the fake API (AC4, AC5, AC6).
-#![allow(missing_docs, clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::similar_names
+)]
 
 mod common;
 
@@ -9,7 +15,7 @@ use std::time::Duration;
 
 use autumn_plugin_kubernetes::api::{KubeApi, LeaseRecord, MemoryKubeApi};
 use autumn_plugin_kubernetes::metrics::KubernetesMetrics;
-use autumn_plugin_kubernetes::{KubeError, LeaderElector, LeaderTask, LeaderTasks};
+use autumn_plugin_kubernetes::{KubeError, LeaderElector, LeaderTask, LeaderTasks, Leadership};
 use autumn_web::AppState;
 use common::{LEASE, NS, advance, elect, leader_config, wait_until};
 use tokio::time::Instant;
@@ -269,12 +275,12 @@ async fn three_candidates_never_overlap() {
         }
         // Crash the leader at 20 s and at 60 s.
         if step == 200 || step == 600 {
-            let idx = views.iter().position(|v| v.is_leader()).unwrap();
+            let idx = views.iter().position(Leadership::is_leader).unwrap();
             handles[idx].take().unwrap().abort();
         }
     }
     assert_eq!(leaders_seen.len(), 3, "{leaders_seen:?}");
-    assert!(views.iter().any(|v| v.is_leader()));
+    assert!(views.iter().any(Leadership::is_leader));
     assert_eq!(api.lease(NS, LEASE).unwrap().transitions, 2);
     for h in handles.into_iter().flatten() {
         h.stop().await;
