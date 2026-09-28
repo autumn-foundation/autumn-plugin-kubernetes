@@ -1,0 +1,49 @@
+[package]
+name = "autumn-plugin-kubernetes"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+description = "Kubernetes plugin for autumn-web: pod identity, Lease leader election, live ConfigMaps, Events, health, metrics, and manifests"
+license = "Apache-2.0"
+repository = "https://github.com/autumn-foundation/autumn-plugin-kubernetes"
+readme = "README.md"
+keywords = ["autumn", "kubernetes", "k8s", "leader-election", "lease"]
+categories = ["web-programming", "asynchronous"]
+
+[features]
+default = []
+# Selects the newest Kubernetes API version in k8s-openapi. For apps only.
+# A library must not turn this on. See the k8s-openapi docs.
+latest = ["k8s-openapi/latest"]
+
+[dependencies]
+autumn-web = { version = "0.7.0", default-features = false }
+futures = "0.3"
+# No version feature here. The app picks one (k8s-openapi rule).
+k8s-openapi = { version = "0.28", default-features = false }
+kube = { version = "4.2", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "0.0.29"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "fs"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+
+[dev-dependencies]
+k8s-openapi = { version = "0.28", default-features = false, features = ["latest"] }
+proptest = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+# `pub(crate)` marks crate-internal items on purpose.
+redundant_pub_crate = "allow"
