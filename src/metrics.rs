@@ -29,8 +29,10 @@ pub struct MetricsSnapshot {
     pub leader_acquired: u64,
     /// Times this replica stopped leading.
     pub leader_lost: u64,
-    /// Failed Lease calls.
+    /// Failed Lease calls (not counting lost races).
     pub lease_errors: u64,
+    /// Lease writes that lost a race (HTTP 409). Normal in an election.
+    pub lease_conflicts: u64,
     /// Published events.
     pub events_published: u64,
     /// Failed event writes.
@@ -49,6 +51,7 @@ pub struct KubernetesMetrics {
     leader_acquired: AtomicU64,
     leader_lost: AtomicU64,
     lease_errors: AtomicU64,
+    lease_conflicts: AtomicU64,
     events_published: AtomicU64,
     events_failed: AtomicU64,
     api_up: AtomicI64,
@@ -71,6 +74,7 @@ impl KubernetesMetrics {
             leader_acquired: AtomicU64::new(0),
             leader_lost: AtomicU64::new(0),
             lease_errors: AtomicU64::new(0),
+            lease_conflicts: AtomicU64::new(0),
             events_published: AtomicU64::new(0),
             events_failed: AtomicU64::new(0),
             api_up: AtomicI64::new(-1),
@@ -100,6 +104,11 @@ impl KubernetesMetrics {
     /// Counts a failed Lease call.
     pub fn lease_error(&self) {
         self.lease_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a Lease write that lost a race (HTTP 409).
+    pub fn lease_conflict(&self) {
+        self.lease_conflicts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Counts an event write.
@@ -149,6 +158,7 @@ impl KubernetesMetrics {
             leader_acquired: self.leader_acquired.load(Ordering::Relaxed),
             leader_lost: self.leader_lost.load(Ordering::Relaxed),
             lease_errors: self.lease_errors.load(Ordering::Relaxed),
+            lease_conflicts: self.lease_conflicts.load(Ordering::Relaxed),
             events_published: self.events_published.load(Ordering::Relaxed),
             events_failed: self.events_failed.load(Ordering::Relaxed),
             api_up: self.api_up.load(Ordering::Relaxed),
@@ -203,9 +213,15 @@ impl MetricsSource for KubernetesMetrics {
             ));
             out.push(family(
                 "kubernetes_lease_errors_total",
-                "Failed Lease API calls",
+                "Failed Lease API calls (lost races not counted)",
                 MetricKind::Counter,
                 vec![sample(&l, s.lease_errors)],
+            ));
+            out.push(family(
+                "kubernetes_lease_conflicts_total",
+                "Lease writes that lost a race (normal in an election)",
+                MetricKind::Counter,
+                vec![sample(&l, s.lease_conflicts)],
             ));
         }
         out.push(family(
@@ -342,6 +358,7 @@ mod tests {
         for name in [
             "kubernetes_leader_lost_total",
             "kubernetes_lease_errors_total",
+            "kubernetes_lease_conflicts_total",
             "kubernetes_events_published_total",
             "kubernetes_events_failed_total",
             "kubernetes_api_up",

@@ -158,7 +158,8 @@ The API check result is reused: 5 s when up, 1 s when down.
 | `kubernetes_leader` | gauge (belief) | `lease` |
 | `kubernetes_leader_acquired_total` | counter | `lease` |
 | `kubernetes_leader_lost_total` | counter | `lease` |
-| `kubernetes_lease_errors_total` | counter | `lease` |
+| `kubernetes_lease_errors_total` | counter (lost races not counted) | `lease` |
+| `kubernetes_lease_conflicts_total` | counter (lost races, normal) | `lease` |
 | `kubernetes_events_published_total` | counter | |
 | `kubernetes_events_failed_total` | counter | |
 | `kubernetes_api_up` | gauge (checked every 5 s) | |

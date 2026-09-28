@@ -459,12 +459,16 @@ impl Loop {
     }
 
     fn failed(&mut self, err: &KubeError) {
-        self.elector.metrics.lease_error();
-        if matches!(err, KubeError::Conflict(_)) {
-            // Another writer won. Do not trust the old holder view.
-            self.holder_is_me = false;
-        }
         let lease = &self.elector.config.lease_name;
+        if matches!(err, KubeError::Conflict(_)) {
+            // Another writer won the race. That is normal in an election:
+            // count it apart, and do not warn. Do not trust the old view.
+            self.holder_is_me = false;
+            self.elector.metrics.lease_conflict();
+            tracing::debug!(lease = %lease, "kubernetes: lease write lost a race");
+            return;
+        }
+        self.elector.metrics.lease_error();
         if self.failing {
             tracing::debug!(lease = %lease, error = %err, "kubernetes: lease call failed");
         } else {

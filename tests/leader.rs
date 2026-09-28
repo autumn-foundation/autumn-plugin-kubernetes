@@ -653,3 +653,38 @@ async fn release_skips_a_lease_that_another_replica_holds() {
     a.stop().await;
     assert!(api.lease(NS, LEASE).unwrap().held_by("b"), "b keeps it");
 }
+
+/// CI found it: two replicas that start together both create the lease. The
+/// loser's 409 is a normal race, not an error.
+#[tokio::test(start_paused = true)]
+async fn a_lost_create_race_is_a_conflict_not_an_error() {
+    let api = MemoryKubeApi::new();
+    // Both GETs see no lease before either create lands.
+    api.set_latency(Duration::from_millis(100));
+    let (ma, mb) = (
+        Arc::new(KubernetesMetrics::new()),
+        Arc::new(KubernetesMetrics::new()),
+    );
+    let a = LeaderElector::new(Arc::new(api.clone()), NS, "a", leader_config())
+        .unwrap()
+        .with_metrics(Arc::clone(&ma))
+        .start();
+    let b = LeaderElector::new(Arc::new(api.clone()), NS, "b", leader_config())
+        .unwrap()
+        .with_metrics(Arc::clone(&mb))
+        .start();
+    advance(S(5)).await;
+    let (sa, sb) = (ma.snapshot(), mb.snapshot());
+    assert_eq!(
+        sa.lease_errors + sb.lease_errors,
+        0,
+        "a race is not an error"
+    );
+    assert_eq!(
+        sa.lease_conflicts + sb.lease_conflicts,
+        1,
+        "one side lost the race"
+    );
+    a.stop().await;
+    b.stop().await;
+}
