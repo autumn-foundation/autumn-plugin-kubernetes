@@ -22,6 +22,7 @@ struct State {
     config_maps: HashMap<Key, watch::Sender<Option<BTreeMap<String, String>>>>,
     events: Vec<(PodRef, PodEvent)>,
     lease_writes: u64,
+    latency: std::time::Duration,
 }
 
 /// In-memory fake of the Kubernetes API. Clones share state.
@@ -106,6 +107,15 @@ impl MemoryKubeApi {
         self.lock().forbidden_leases = forbidden;
     }
 
+    /// Every Lease call and version check waits this long first.
+    pub fn set_latency(&self, latency: std::time::Duration) {
+        self.lock().latency = latency;
+    }
+
+    fn latency(&self) -> std::time::Duration {
+        self.lock().latency
+    }
+
     /// When `true`, event writes fail.
     pub fn set_events_failing(&self, failing: bool) {
         self.lock().events_failing = failing;
@@ -187,11 +197,74 @@ impl MemoryKubeApi {
     }
 }
 
+impl MemoryKubeApi {
+    fn do_get(&self, namespace: &str, name: &str) -> Result<Option<LeaseRecord>, KubeError> {
+        let s = self.lock();
+        Self::lease_guard(&s, "get")?;
+        Ok(s.leases.get(&key(namespace, name)).cloned())
+    }
+
+    fn do_create(
+        &self,
+        namespace: &str,
+        name: &str,
+        record: &LeaseRecord,
+    ) -> Result<LeaseRecord, KubeError> {
+        let mut s = self.lock();
+        Self::write_guard(&mut s, "create")?;
+        let k = key(namespace, name);
+        let result = if s.leases.contains_key(&k) {
+            Err(KubeError::Conflict(format!(
+                "leases.coordination.k8s.io \"{name}\" already exists"
+            )))
+        } else {
+            Ok(Self::store(&mut s, k, record))
+        };
+        drop(s);
+        result
+    }
+
+    fn do_replace(
+        &self,
+        namespace: &str,
+        name: &str,
+        record: &LeaseRecord,
+    ) -> Result<LeaseRecord, KubeError> {
+        let mut s = self.lock();
+        Self::write_guard(&mut s, "update")?;
+        let k = key(namespace, name);
+        let result = match s.leases.get(&k) {
+            None => Err(KubeError::NotFound(format!(
+                "leases.coordination.k8s.io \"{name}\" not found"
+            ))),
+            Some(current)
+                if record.resource_version.is_none()
+                    || record.resource_version != current.resource_version =>
+            {
+                Err(KubeError::Conflict(format!(
+                    "Operation cannot be fulfilled on leases.coordination.k8s.io \"{name}\": \
+                     the object has been modified"
+                )))
+            }
+            Some(_) => Ok(Self::store(&mut s, k, record)),
+        };
+        drop(s);
+        result
+    }
+}
+
+async fn wait(latency: std::time::Duration) {
+    if !latency.is_zero() {
+        tokio::time::sleep(latency).await;
+    }
+}
+
 impl KubeApi for MemoryKubeApi {
     fn server_version(&self) -> ApiFuture<'_, String> {
-        let down = self.lock().down;
+        let latency = self.latency();
         Box::pin(async move {
-            if down {
+            wait(latency).await;
+            if self.lock().down {
                 Err(down_error())
             } else {
                 Ok("v1.34.0-memory".to_owned())
@@ -204,11 +277,11 @@ impl KubeApi for MemoryKubeApi {
         namespace: &'a str,
         name: &'a str,
     ) -> ApiFuture<'a, Option<LeaseRecord>> {
-        let result = {
-            let s = self.lock();
-            Self::lease_guard(&s, "get").map(|()| s.leases.get(&key(namespace, name)).cloned())
-        };
-        Box::pin(async move { result })
+        let latency = self.latency();
+        Box::pin(async move {
+            wait(latency).await;
+            self.do_get(namespace, name)
+        })
     }
 
     fn create_lease<'a>(
@@ -217,20 +290,11 @@ impl KubeApi for MemoryKubeApi {
         name: &'a str,
         record: &'a LeaseRecord,
     ) -> ApiFuture<'a, LeaseRecord> {
-        let result = {
-            let mut s = self.lock();
-            Self::write_guard(&mut s, "create").and_then(|()| {
-                let k = key(namespace, name);
-                if s.leases.contains_key(&k) {
-                    Err(KubeError::Conflict(format!(
-                        "leases.coordination.k8s.io \"{name}\" already exists"
-                    )))
-                } else {
-                    Ok(Self::store(&mut s, k, record))
-                }
-            })
-        };
-        Box::pin(async move { result })
+        let latency = self.latency();
+        Box::pin(async move {
+            wait(latency).await;
+            self.do_create(namespace, name, record)
+        })
     }
 
     fn replace_lease<'a>(
@@ -239,25 +303,11 @@ impl KubeApi for MemoryKubeApi {
         name: &'a str,
         record: &'a LeaseRecord,
     ) -> ApiFuture<'a, LeaseRecord> {
-        let result = {
-            let mut s = self.lock();
-            Self::write_guard(&mut s, "update").and_then(|()| {
-                let k = key(namespace, name);
-                let current = s.leases.get(&k).ok_or_else(|| {
-                    KubeError::NotFound(format!("leases.coordination.k8s.io \"{name}\" not found"))
-                })?;
-                if record.resource_version.is_none()
-                    || record.resource_version != current.resource_version
-                {
-                    return Err(KubeError::Conflict(format!(
-                        "Operation cannot be fulfilled on leases.coordination.k8s.io \"{name}\": \
-                         the object has been modified"
-                    )));
-                }
-                Ok(Self::store(&mut s, k, record))
-            })
-        };
-        Box::pin(async move { result })
+        let latency = self.latency();
+        Box::pin(async move {
+            wait(latency).await;
+            self.do_replace(namespace, name, record)
+        })
     }
 
     fn watch_config_map(

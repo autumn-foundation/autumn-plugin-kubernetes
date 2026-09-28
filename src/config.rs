@@ -56,6 +56,9 @@ pub struct LeaderElectionConfig {
     pub retry_period_secs: u64,
     /// Clear the holder on shutdown, so another replica takes over at once.
     pub release_on_shutdown: bool,
+    /// Process roles that take part (`combined`, `web`, `worker`). Empty: all.
+    /// A leader task runs only on a replica that takes part.
+    pub roles: Vec<String>,
 }
 
 /// `[kubernetes.config_maps]` config.
@@ -89,11 +92,22 @@ impl Default for LeaderElectionConfig {
             renew_deadline_secs: 10,
             retry_period_secs: 2,
             release_on_shutdown: true,
+            roles: Vec::new(),
         }
     }
 }
 
 impl LeaderElectionConfig {
+    /// Returns `true` when a process with `role` takes part in the election.
+    #[must_use]
+    pub fn campaigns_for(&self, role: autumn_web::ProcessRole) -> bool {
+        self.roles.is_empty()
+            || self
+                .roles
+                .iter()
+                .any(|r| autumn_web::ProcessRole::from_env_value(r) == Some(role))
+    }
+
     /// Lease duration in milliseconds.
     #[must_use]
     pub const fn lease_duration_ms(&self) -> u64 {
@@ -359,6 +373,15 @@ impl KubernetesConfig {
                     le.retry_period_secs
                 )));
             }
+            if let Some(bad) = le
+                .roles
+                .iter()
+                .find(|r| autumn_web::ProcessRole::from_env_value(r).is_none())
+            {
+                return Err(config_err(format!(
+                    "leader_election.roles: {bad:?} is not combined, web, or worker"
+                )));
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for name in &self.config_maps.watch {
@@ -601,6 +624,40 @@ mod tests {
         let mut c = KubernetesConfig::default();
         c.leader_election.renew_deadline_secs = 99;
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn roles_gate_the_campaign() {
+        use autumn_web::ProcessRole;
+        let mut le = LeaderElectionConfig::default();
+        assert!(le.campaigns_for(ProcessRole::Web), "empty list: all roles");
+        le.roles = vec!["worker".into(), "Combined".into()];
+        assert!(le.campaigns_for(ProcessRole::Worker));
+        assert!(le.campaigns_for(ProcessRole::Combined));
+        assert!(!le.campaigns_for(ProcessRole::Web));
+    }
+
+    #[test]
+    fn validate_checks_roles() {
+        let mut c = leader("l");
+        c.leader_election.roles = vec!["worker".into(), "cron".into()];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("cron"), "{err}");
+    }
+
+    #[test]
+    fn env_sets_roles() {
+        let c = KubernetesConfig::from_sources(
+            None,
+            None,
+            None,
+            env(&[(
+                "AUTUMN_KUBERNETES__LEADER_ELECTION__ROLES",
+                "worker,combined",
+            )]),
+        )
+        .unwrap();
+        assert_eq!(c.leader_election.roles, vec!["worker", "combined"]);
     }
 
     #[test]
