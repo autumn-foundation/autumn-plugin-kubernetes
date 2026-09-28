@@ -210,38 +210,16 @@ impl KubernetesPlugin {
         }
         let pod = self.pod.clone().unwrap_or_else(PodInfo::from_env);
         state.insert_extension(pod.clone());
-        let idle = |mode: &'static str| KubernetesRuntime {
-            mode,
-            namespace: None,
-            cancel: CancellationToken::new(),
-            watches: Vec::new(),
-            elector: None,
-            tasks: None,
-            events: None,
-            metrics: Arc::clone(&metrics),
-            health: Arc::clone(&health),
-            leadership: None,
-            config_maps: None,
-        };
-        let detached = |mode: &'static str| {
-            health.set(HealthTarget {
-                api: None,
-                mode,
-                namespace: None,
-                leadership: None,
-                config_maps: None,
-            });
-            tracing::info!(mode, "kubernetes plugin started without a cluster");
-            idle(mode)
-        };
         if !config.enabled {
-            return Ok(detached("disabled"));
+            return Ok(self.start_detached("disabled", &config, &pod, state, role, metrics, health));
         }
         let (api, mode) = match self.connect(&pod).await {
             Ok(found) => found,
             Err(KubeError::NoCluster(why)) if !config.required => {
                 tracing::debug!(reason = %why, "kubernetes: no cluster found");
-                return Ok(detached("detached"));
+                return Ok(
+                    self.start_detached("detached", &config, &pod, state, role, metrics, health)
+                );
             }
             Err(e) => return Err(e),
         };
@@ -345,6 +323,7 @@ impl KubernetesPlugin {
             cancel,
             watches,
             elector,
+            local_leader: None,
             tasks,
             events: Some(events),
             metrics,
@@ -352,6 +331,77 @@ impl KubernetesPlugin {
             leadership,
             config_maps,
         })
+    }
+
+    /// Starts with no API: `disabled` or `detached`. With
+    /// `lead_when_detached`, this process leads and runs its leader tasks.
+    #[allow(clippy::too_many_arguments)] // Private; one call site each.
+    fn start_detached(
+        self,
+        mode: &'static str,
+        config: &KubernetesConfig,
+        pod: &PodInfo,
+        state: &AppState,
+        role: ProcessRole,
+        metrics: Arc<KubernetesMetrics>,
+        health: Arc<KubernetesHealth>,
+    ) -> KubernetesRuntime {
+        let le = &config.leader_election;
+        let lead =
+            mode == "detached" && le.enabled && le.lead_when_detached && le.campaigns_for(role);
+        let (local_leader, leadership, tasks) = if lead {
+            let identity = if le.identity.is_empty() {
+                default_identity(pod)
+            } else {
+                le.identity.clone()
+            };
+            let (tx, leadership) = crate::leader::local_leader(&identity, &le.lease_name);
+            state.insert_extension(leadership.clone());
+            tracing::warn!(
+                identity = %identity,
+                "kubernetes: no cluster; this process acts as leader (lead_when_detached)"
+            );
+            let tasks = (!self.leader_tasks.is_empty()).then(|| {
+                LeaderTasks::start(
+                    leadership.clone(),
+                    self.leader_tasks,
+                    state.clone(),
+                    TASK_STOP_TIMEOUT,
+                )
+            });
+            (Some(tx), Some(leadership), tasks)
+        } else {
+            if le.enabled && !self.leader_tasks.is_empty() {
+                tracing::warn!(
+                    mode,
+                    "kubernetes: no cluster; leader tasks do not run \
+                     (set leader_election.lead_when_detached = true for local development)"
+                );
+            }
+            (None, None, None)
+        };
+        health.set(HealthTarget {
+            api: None,
+            mode,
+            namespace: None,
+            leadership: leadership.clone(),
+            config_maps: None,
+        });
+        tracing::info!(mode, "kubernetes plugin started without a cluster");
+        KubernetesRuntime {
+            mode,
+            namespace: None,
+            cancel: CancellationToken::new(),
+            watches: Vec::new(),
+            elector: None,
+            local_leader,
+            tasks,
+            events: None,
+            metrics,
+            health,
+            leadership,
+            config_maps: None,
+        }
     }
 }
 
@@ -369,6 +419,7 @@ pub struct KubernetesRuntime {
     cancel: CancellationToken,
     watches: Vec<JoinHandle<()>>,
     elector: Option<ElectorHandle>,
+    local_leader: Option<tokio::sync::watch::Sender<crate::leader::LeaderState>>,
     tasks: Option<LeaderTasks>,
     events: Option<EventSink>,
     metrics: Arc<KubernetesMetrics>,
@@ -432,6 +483,9 @@ impl KubernetesRuntime {
                 .is_err()
         {
             tracing::debug!("kubernetes: Stopping event timed out");
+        }
+        if let Some(tx) = &self.local_leader {
+            tx.send_modify(|s| s.leading = false);
         }
         if let Some(tasks) = self.tasks {
             tasks.stop().await;

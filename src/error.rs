@@ -54,3 +54,50 @@ impl KubeError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classes_are_short_and_have_no_detail() {
+        let cases = [
+            (KubeError::Config("secret-ish".into()), "config"),
+            (KubeError::NoCluster("x".into()), "no_cluster"),
+            (KubeError::NotFound("x".into()), "not_found"),
+            (KubeError::Conflict("x".into()), "conflict"),
+            (
+                KubeError::Forbidden {
+                    verb: "get".into(),
+                    resource: "leases".into(),
+                },
+                "forbidden",
+            ),
+            (KubeError::Api("https://10.0.0.1".into()), "api"),
+            (
+                KubeError::Decode {
+                    name: "n".into(),
+                    key: "k".into(),
+                    message: "m".into(),
+                },
+                "decode",
+            ),
+        ];
+        for (err, class) in cases {
+            assert_eq!(err.class(), class);
+            assert!(!err.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn forbidden_names_the_fix() {
+        let e = KubeError::Forbidden {
+            verb: "update".into(),
+            resource: "leases.coordination.k8s.io".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "kubernetes denied update on leases.coordination.k8s.io; add it to the Role"
+        );
+    }
+}

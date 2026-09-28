@@ -418,3 +418,60 @@ async fn shutdown_hook_releases_lease() {
     assert!(api.lease(NS, LEASE).unwrap().is_free());
     let _: Arc<dyn KubeApi> = Arc::new(api);
 }
+
+#[tokio::test(start_paused = true)]
+async fn detached_runs_no_leader_tasks_by_default() {
+    let runs = Arc::new(AtomicU32::new(0));
+    let r2 = Arc::clone(&runs);
+    let rt = KubernetesPlugin::with_config(config())
+        .with_connector(no_cluster)
+        .leader_task(LeaderTask::new("t", move |_s: AppState, _c| {
+            let r2 = Arc::clone(&r2);
+            async move {
+                r2.fetch_add(1, Ordering::SeqCst);
+            }
+        }))
+        .start(&AppState::for_test())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert!(rt.leadership().is_none());
+    rt.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn lead_when_detached_runs_leader_tasks_locally() {
+    let mut cfg = config();
+    cfg.leader_election.lead_when_detached = true;
+    let running = Arc::new(AtomicU32::new(0));
+    let r2 = Arc::clone(&running);
+    let state = AppState::for_test();
+    let rt = KubernetesPlugin::with_config(cfg)
+        .with_connector(no_cluster)
+        .with_pod_info(pod())
+        .leader_task(LeaderTask::new("t", move |_s: AppState, cancel| {
+            let r2 = Arc::clone(&r2);
+            async move {
+                r2.fetch_add(1, Ordering::SeqCst);
+                cancel.cancelled().await;
+                r2.fetch_sub(1, Ordering::SeqCst);
+            }
+        }))
+        .start(&state)
+        .await
+        .unwrap();
+    assert_eq!(rt.mode(), "detached");
+    let lead = Leadership::from_state(&state).unwrap();
+    assert!(lead.is_leader());
+    assert_eq!(lead.holder().as_deref(), Some(lead.identity()));
+    wait_until(Duration::from_secs(5), || {
+        running.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let out = rt.health().check().await;
+    assert_eq!(out.details["leader"]["leading"], true);
+    rt.shutdown().await;
+    assert!(!lead.is_leader());
+    assert_eq!(running.load(Ordering::SeqCst), 0, "task stopped");
+}

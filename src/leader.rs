@@ -99,6 +99,24 @@ impl Leadership {
     }
 }
 
+/// A handle that always leads, for detached local development. Leadership
+/// ends when the sender sends `leading = false` or is dropped.
+pub(crate) fn local_leader(
+    identity: &str,
+    lease: &str,
+) -> (watch::Sender<LeaderState>, Leadership) {
+    let (tx, rx) = watch::channel(LeaderState {
+        leading: true,
+        holder: Some(identity.to_owned()),
+    });
+    let leadership = Leadership {
+        identity: Arc::from(identity),
+        lease: Arc::from(lease),
+        rx,
+    };
+    (tx, leadership)
+}
+
 /// Runs leader election for one lease.
 pub struct LeaderElector {
     api: Arc<dyn KubeApi>,

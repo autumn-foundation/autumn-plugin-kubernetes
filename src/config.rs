@@ -56,6 +56,9 @@ pub struct LeaderElectionConfig {
     pub retry_period_secs: u64,
     /// Clear the holder on shutdown, so another replica takes over at once.
     pub release_on_shutdown: bool,
+    /// With no cluster (detached), act as leader so leader tasks run. For
+    /// local development only. Default: `false`.
+    pub lead_when_detached: bool,
     /// Process roles that take part (`combined`, `web`, `worker`). Empty: all.
     /// A leader task runs only on a replica that takes part.
     pub roles: Vec<String>,
@@ -92,6 +95,7 @@ impl Default for LeaderElectionConfig {
             renew_deadline_secs: 10,
             retry_period_secs: 2,
             release_on_shutdown: true,
+            lead_when_detached: false,
             roles: Vec::new(),
         }
     }
