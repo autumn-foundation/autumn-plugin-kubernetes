@@ -60,7 +60,8 @@ pub fn example_bin(name: &str) -> std::path::PathBuf {
         },
         std::path::PathBuf::from,
     );
-    let path = dir.join(name);
+    // Absolute: tests run the program with another working directory.
+    let path = std::path::absolute(dir.join(name)).unwrap();
     assert!(
         path.is_file(),
         "no example program {}: run `cargo build --examples` and set \
