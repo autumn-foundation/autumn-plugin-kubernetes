@@ -76,8 +76,9 @@ jobs:
   verus:
     runs-on: ubuntu-latest
     env:
-      VERUS_TAG: release/rolling/0.2026.09.28.ad64ec6
-      VERUS_ZIP: verus-0.2026.09.28.ad64ec6-x86-linux.zip
+      # A weekly release. Rolling releases are deleted after a few days.
+      VERUS_TAG: release/0.2026.09.27.3cf1832
+      VERUS_ZIP: verus-0.2026.09.27.3cf1832-x86-linux.zip
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.98.1
