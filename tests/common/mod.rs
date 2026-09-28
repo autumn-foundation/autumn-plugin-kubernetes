@@ -45,3 +45,27 @@ pub async fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) {
 pub async fn advance(d: Duration) {
     tokio::time::sleep(d).await;
 }
+
+/// Path of a built example program.
+///
+/// `AUTUMN_K8S_EXAMPLES_DIR` wins (CI sets it). Else `examples/<name>` next to
+/// the test binary, which `cargo test` writes. `cargo llvm-cov --all-targets`
+/// builds examples as test harnesses, so under it, run
+/// `cargo build --examples` and set the variable to `target/debug/examples`.
+pub fn example_bin(name: &str) -> std::path::PathBuf {
+    let dir = std::env::var_os("AUTUMN_K8S_EXAMPLES_DIR").map_or_else(
+        || {
+            let exe = std::env::current_exe().unwrap();
+            exe.parent().unwrap().parent().unwrap().join("examples")
+        },
+        std::path::PathBuf::from,
+    );
+    let path = dir.join(name);
+    assert!(
+        path.is_file(),
+        "no example program {}: run `cargo build --examples` and set \
+         AUTUMN_K8S_EXAMPLES_DIR=target/debug/examples",
+        path.display()
+    );
+    path
+}

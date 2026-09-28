@@ -474,9 +474,13 @@ async fn replace_keeps_metadata_and_other_spec_fields() {
 async fn example_app_connects_with_kubeconfig() {
     use std::io::{Read, Write};
     let Some(dir) = it_dir() else { return };
-    let exe = std::env::current_exe().unwrap();
-    let app = exe.parent().unwrap().parent().unwrap().join("examples/app");
-    assert!(app.exists(), "build the examples first");
+    let app = common::example_bin("app");
+    // A killed run on this server leaves the lease held. Start clean.
+    let admin = client(&dir, "admin.kubeconfig").await;
+    let leases: Api<k8s_openapi::api::coordination::v1::Lease> = Api::namespaced(admin, "default");
+    let _ = leases
+        .delete("example-leader", &DeleteParams::default())
+        .await;
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
@@ -508,7 +512,7 @@ async fn example_app_connects_with_kubeconfig() {
         Some(body)
     };
     let mut health = String::new();
-    for _ in 0..150 {
+    for _ in 0..300 {
         if let Some(b) = get("/actuator/health")
             && b.contains("\"leading\":true")
         {

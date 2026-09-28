@@ -32,7 +32,9 @@ cargo test
 scripts/envtest.sh start              # prints export KUBE_IT_DIR=...
 KUBE_IT_DIR=$PWD/target/envtest cargo test --test apiserver
 scripts/envtest.sh stop
-KUBE_IT_DIR=$PWD/target/envtest cargo llvm-cov --all-targets --summary-only
+cargo build --examples   # llvm-cov builds examples as test harnesses
+KUBE_IT_DIR=$PWD/target/envtest AUTUMN_K8S_EXAMPLES_DIR=$PWD/target/debug/examples \
+  cargo llvm-cov --all-targets --summary-only
 verus verus/policy.rs
 K8S_OPENAPI_ENABLED_VERSION=1.32 cargo check --lib   # each of 1.32..1.36
 ```

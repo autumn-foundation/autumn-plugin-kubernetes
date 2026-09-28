@@ -58,9 +58,13 @@ jobs:
         run: |
           scripts/envtest.sh start
           echo "KUBE_IT_DIR=$PWD/target/envtest" >> "$GITHUB_ENV"
+      # llvm-cov builds examples as test harnesses. Tests that run the
+      # example programs use these normal builds.
+      - run: cargo build --examples
       - name: Test with coverage (fail under 85% lines)
         env:
           KUBE_IT_REQUIRED: "1"
+          AUTUMN_K8S_EXAMPLES_DIR: target/debug/examples
         run: cargo llvm-cov --all-targets --fail-under-lines 85 --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with:

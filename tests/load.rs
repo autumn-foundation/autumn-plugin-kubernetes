@@ -4,20 +4,13 @@
 //! not exist, and the config files are in the working directory.
 #![allow(missing_docs, clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 
 fn example(name: &str) -> PathBuf {
-    // target/<profile>/deps/load-<hash> -> target/<profile>/examples/<name>
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().unwrap().parent().unwrap().join("examples");
-    let path = dir.join(name);
-    assert!(
-        path.exists(),
-        "build the examples first: {}",
-        path.display()
-    );
-    path
+    common::example_bin(name)
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
