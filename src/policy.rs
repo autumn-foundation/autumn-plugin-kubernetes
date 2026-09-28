@@ -22,67 +22,109 @@ pub enum Action {
 }
 
 /// Returns `true` when the lease timing is safe to run.
+///
+/// Rules: `retry > 0`, `renew > 1.2 * retry`, `lease > renew`, and
+/// `lease <= MAX_LEASE_MS`.
 #[must_use]
-pub const fn timing_valid(_lease_ms: u64, _renew_ms: u64, _retry_ms: u64) -> bool {
-    todo!()
+pub const fn timing_valid(lease_ms: u64, renew_ms: u64, retry_ms: u64) -> bool {
+    if lease_ms > MAX_LEASE_MS || retry_ms == 0 || lease_ms <= renew_ms || retry_ms >= renew_ms {
+        return false;
+    }
+    // Here retry < renew < lease <= MAX_LEASE_MS. No overflow.
+    renew_ms * 5 > retry_ms * 6
 }
 
 /// Adds a jitter of 0 to 20% to `base_ms`. `rand` is any random value.
+///
+/// `base_ms` must be `MAX_LEASE_MS` or less. Config validation makes sure.
 #[must_use]
-pub const fn jittered_ms(_base_ms: u64, _rand: u64) -> u64 {
-    todo!()
+pub const fn jittered_ms(base_ms: u64, rand: u64) -> u64 {
+    let span = base_ms / JITTER_DIVISOR + 1;
+    base_ms.saturating_add(rand % span)
 }
 
 /// Decides the next step.
+///
+/// `observed_age_ms` is the local time since this replica saw the record
+/// change. Remote timestamps are not used, so clock skew has no effect.
 #[must_use]
 pub const fn decide(
-    _holder_is_me: bool,
-    _holder_empty: bool,
-    _observed_age_ms: u64,
-    _duration_ms: u64,
+    holder_is_me: bool,
+    holder_empty: bool,
+    observed_age_ms: u64,
+    duration_ms: u64,
 ) -> Action {
-    todo!()
+    if holder_is_me {
+        Action::Renew
+    } else if holder_empty || observed_age_ms >= duration_ms {
+        Action::Acquire
+    } else {
+        Action::Wait
+    }
 }
 
-/// The lease duration for expiry.
+/// The lease duration for expiry. A positive record value wins. Else the
+/// local config value.
 #[must_use]
-pub const fn effective_duration_ms(_record_secs: i32, _fallback_ms: u64) -> u64 {
-    todo!()
+pub const fn effective_duration_ms(record_secs: i32, fallback_ms: u64) -> u64 {
+    if record_secs > 0 {
+        record_secs.unsigned_abs() as u64 * 1000
+    } else {
+        fallback_ms
+    }
 }
 
-/// `leaseTransitions` after a write.
+/// `leaseTransitions` after a write. It grows by one when the holder
+/// changes. It stops at `u32::MAX`.
 #[must_use]
-pub const fn next_transitions(_old: u32, _holder_is_me: bool) -> u32 {
-    todo!()
+pub const fn next_transitions(old: u32, holder_is_me: bool) -> u32 {
+    if holder_is_me {
+        old
+    } else {
+        old.saturating_add(1)
+    }
 }
 
 /// Local time when the record was last seen to change.
 #[must_use]
-pub const fn observed_at(_prev_at: Option<u64>, _changed: bool, _now_ms: u64) -> u64 {
-    todo!()
+pub const fn observed_at(prev_at: Option<u64>, changed: bool, now_ms: u64) -> u64 {
+    match prev_at {
+        Some(at) if !changed => at,
+        _ => now_ms,
+    }
 }
 
-/// Time since the record was seen to change.
+/// Time since the record was seen to change. Zero if the clock is behind.
 #[must_use]
-pub const fn observed_age_ms(_now_ms: u64, _at_ms: u64) -> u64 {
-    todo!()
+pub const fn observed_age_ms(now_ms: u64, at_ms: u64) -> u64 {
+    now_ms.saturating_sub(at_ms)
 }
 
 /// Returns `true` while the replica believes it leads.
+///
+/// `sent_ms` is when the last successful write was sent. Belief ends
+/// `renew_ms` after it, or at once when another holder is seen.
 #[must_use]
-pub const fn leading(_now_ms: u64, _sent_ms: Option<u64>, _renew_ms: u64, _holder_is_me: bool) -> bool {
-    todo!()
+pub const fn leading(now_ms: u64, sent_ms: Option<u64>, renew_ms: u64, holder_is_me: bool) -> bool {
+    match sent_ms {
+        Some(s) => holder_is_me && (now_ms < s || now_ms - s < renew_ms),
+        None => false,
+    }
 }
 
-/// `terminationGracePeriodSeconds` by the Autumn formula.
+/// `terminationGracePeriodSeconds` by the Autumn formula:
+/// `preStop hook + prestop_grace + shutdown_timeout + buffer`. Saturating.
 #[must_use]
 pub const fn grace_period_secs(
-    _prestop_hook: u64,
-    _prestop_grace: u64,
-    _shutdown_timeout: u64,
-    _buffer: u64,
+    prestop_hook: u64,
+    prestop_grace: u64,
+    shutdown_timeout: u64,
+    buffer: u64,
 ) -> u64 {
-    todo!()
+    prestop_hook
+        .saturating_add(prestop_grace)
+        .saturating_add(shutdown_timeout)
+        .saturating_add(buffer)
 }
 
 #[cfg(test)]
@@ -94,6 +136,13 @@ mod tests {
 
     fn spec_timing_valid(lease: i128, renew: i128, retry: i128) -> bool {
         retry > 0 && renew * 5 > retry * 6 && lease > renew && lease <= i128::from(MAX_LEASE_MS)
+    }
+
+    /// Valid `(lease, renew, retry)` triples.
+    fn valid_timing() -> impl Strategy<Value = (u64, u64, u64)> {
+        (1..=MAX_LEASE_MS / 2)
+            .prop_flat_map(|retry| (Just(retry), (retry * 6 / 5 + 1)..MAX_LEASE_MS))
+            .prop_flat_map(|(retry, renew)| ((renew + 1)..=MAX_LEASE_MS, Just(renew), Just(retry)))
     }
 
     fn spec_leading(now: i128, sent: Option<i128>, renew: i128, me: bool) -> bool {
@@ -123,7 +172,10 @@ mod tests {
         assert!(!timing_valid(15_000, 10_000, 0), "retry 0");
         assert!(!timing_valid(10_000, 10_000, 2_000), "lease == renew");
         assert!(!timing_valid(15_000, 12_000, 10_000), "renew <= 1.2 retry");
-        assert!(!timing_valid(MAX_LEASE_MS + 1, 10_000, 2_000), "lease too long");
+        assert!(
+            !timing_valid(MAX_LEASE_MS + 1, 10_000, 2_000),
+            "lease too long"
+        );
         // Regression: Verus found an overflow on a huge retry.
         assert!(!timing_valid(15_000, 10_000, u64::MAX));
     }
@@ -191,8 +243,8 @@ mod tests {
         }
 
         #[test]
-        fn valid_timing_fits_jittered_retry(lease in 1..=MAX_LEASE_MS, renew in 1..=MAX_LEASE_MS, retry in 1..=MAX_LEASE_MS, rand: u64) {
-            prop_assume!(timing_valid(lease, renew, retry));
+        fn valid_timing_fits_jittered_retry((lease, renew, retry) in valid_timing(), rand: u64) {
+            prop_assert!(timing_valid(lease, renew, retry));
             prop_assert!(jittered_ms(retry, rand) < renew);
         }
 
@@ -219,9 +271,9 @@ mod tests {
         #[test]
         fn no_overlap_on_shared_time_line(
             sent in 0..1_000_000u64, d1 in 0..100_000u64, d2 in 0..100_000u64,
-            now in 0..2_000_000u64, lease in 1..=MAX_LEASE_MS, renew in 1..=MAX_LEASE_MS, retry in 1..=MAX_LEASE_MS,
+            now in 0..2_000_000u64, (lease, renew, retry) in valid_timing(),
         ) {
-            prop_assume!(timing_valid(lease, renew, retry));
+            prop_assert!(timing_valid(lease, renew, retry));
             let observed = sent + d1 + d2;
             let believes = leading(now, Some(sent), renew, true);
             let takes_over = decide(false, false, observed_age_ms(now, observed), lease) == Action::Acquire
