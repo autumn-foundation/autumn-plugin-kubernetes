@@ -73,6 +73,19 @@ Selected scope: items 1 to 8.
 | Metric label cardinality grows. | Labels are lease and ConfigMap names from config only. |
 | Tests need a cluster. | `KubeApi` trait with a public `MemoryKubeApi` fake. Real API server tests with `kube-apiserver` + `etcd` binaries (no containers). |
 
+Found during implementation:
+
+| How to fail | Counter-measure |
+|---|---|
+| Probes fail: Autumn binds `127.0.0.1` by default. | Manifest sets `AUTUMN_SERVER__HOST=0.0.0.0`. |
+| A dead elector (panic) keeps its last "leading" view. | A closed state channel reads as not leading. |
+| The fake drifts from the real server (create on update). | One contract for fake and real client. |
+| A library k8s-openapi feature breaks apps on another version. | No feature in the library. CI checks 1.32 to 1.36. JSON where a type changes. |
+| `HTTPS_PROXY` in kubeconfig mode stops the client. | Turn on kube `http-proxy`. |
+| `exec sleep` fails on distroless images. | `preStop` `sleep` action. |
+| Detached replicas outside Kubernetes all run the singleton. | Leader tasks run detached only with `lead_when_detached`. |
+| Huge `retry_period` overflows the timing check (Verus found it). | Reject `retry >= renew` first. |
+
 ## 6. Six thinking hats
 
 - **White (facts):** Lease fields: `holderIdentity`, `leaseDurationSeconds`, `acquireTime`, `renewTime`, `leaseTransitions`. client-go uses the observed time, not `renewTime`, for expiry. Update needs a matching `resourceVersion`. Events use `events.k8s.io/v1`. Autumn default shutdown timeout is 30 s.
@@ -110,6 +123,8 @@ stateDiagram-v2
 ```
 
 Modules:
+
+ADRs: `docs/adr/0001` to `0004`.
 
 - `policy` — pure rules. Verified core.
 - `api` — `KubeApi` trait, `KubeClientApi` (real), `MemoryKubeApi` (fake).

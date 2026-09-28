@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+
+  clippy:
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # The library must build on each Kubernetes version that k8s-openapi has.
+  k8s-versions:
+    needs: fmt
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        k8s: ["1.32", "1.33", "1.34", "1.35", "1.36"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: k8s-${{ matrix.k8s }}
+      - run: cargo check --lib
+        env:
+          K8S_OPENAPI_ENABLED_VERSION: ${{ matrix.k8s }}
+
+  test:
+    needs: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/autumn-envtest
+          key: envtest-v1.34.1-v3.5.21
+      - name: Start kube-apiserver and etcd
+        run: |
+          scripts/envtest.sh start
+          echo "KUBE_IT_DIR=$PWD/target/envtest" >> "$GITHUB_ENV"
+      - name: Test with coverage (fail under 85% lines)
+        env:
+          KUBE_IT_REQUIRED: "1"
+        run: cargo llvm-cov --all-targets --fail-under-lines 85 --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+      - if: failure()
+        run: tail -n 100 target/envtest/apiserver.log || true
+
+  verus:
+    runs-on: ubuntu-latest
+    env:
+      VERUS_TAG: release/rolling/0.2026.09.28.ad64ec6
+      VERUS_ZIP: verus-0.2026.09.28.ad64ec6-x86-linux.zip
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.1
+      - name: Install Verus
+        run: |
+          curl -fsSL -o verus.zip \
+            "https://github.com/verus-lang/verus/releases/download/${VERUS_TAG//\//%2F}/$VERUS_ZIP"
+          unzip -q verus.zip -d "$HOME/verus"
+      - name: Verify the policy spec
+        run: "$HOME/verus/verus-x86-linux/verus verus/policy.rs"
