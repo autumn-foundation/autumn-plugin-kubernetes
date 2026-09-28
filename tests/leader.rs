@@ -1,0 +1,767 @@
+//! Leader election and leader tasks on the fake API (AC4, AC5, AC6).
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::similar_names
+)]
+
+mod common;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use autumn_plugin_kubernetes::api::{KubeApi, LeaseRecord, MemoryKubeApi};
+use autumn_plugin_kubernetes::metrics::KubernetesMetrics;
+use autumn_plugin_kubernetes::{KubeError, LeaderElector, LeaderTask, LeaderTasks, Leadership};
+use autumn_web::AppState;
+use common::{LEASE, NS, advance, elect, leader_config, wait_until};
+use tokio::time::Instant;
+
+const S: fn(u64) -> Duration = Duration::from_secs;
+
+#[tokio::test(start_paused = true)]
+async fn single_candidate_creates_and_leads() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let lead = a.leadership();
+    assert_eq!(lead.identity(), "a");
+    assert_eq!(lead.lease_name(), LEASE);
+    assert!(lead.wait_until_leader().await);
+    assert!(lead.is_leader());
+    assert_eq!(lead.holder().as_deref(), Some("a"));
+    let rec = api.lease(NS, LEASE).unwrap();
+    assert!(rec.held_by("a"));
+    assert_eq!(rec.lease_duration_secs, 15);
+    assert_eq!(rec.transitions, 0);
+    assert!(rec.acquire_time.is_some() && rec.renew_time.is_some());
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn leader_renews_every_retry_period() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    let first = api.lease(NS, LEASE).unwrap();
+    let writes = api.lease_writes();
+    advance(S(10)).await;
+    // 10 s / (2 s to 2.4 s) = 4 or 5 renews.
+    assert!(api.lease_writes() - writes >= 4, "{}", api.lease_writes());
+    let later = api.lease(NS, LEASE).unwrap();
+    assert!(later.renew_time > first.renew_time);
+    assert_eq!(
+        later.acquire_time, first.acquire_time,
+        "renew keeps acquire time"
+    );
+    assert_eq!(later.transitions, 0);
+    assert!(a.leadership().is_leader());
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn follower_waits_while_leader_renews() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    let b = elect(&api, "b");
+    let lb = b.leadership();
+    for _ in 0..600 {
+        advance(Duration::from_millis(100)).await;
+        assert!(!lb.is_leader());
+    }
+    assert_eq!(lb.holder().as_deref(), Some("a"));
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crash_fails_over_after_lease_duration() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    let b = elect(&api, "b");
+    advance(S(5)).await;
+    a.abort();
+    let t0 = Instant::now();
+    let lb = b.leadership();
+    wait_until(S(30), || lb.is_leader()).await;
+    let took = t0.elapsed();
+    // Last renew: at most 2.4 s before the crash. b sees it within one
+    // jittered retry (2.4 s). Takeover: 15 s later, at b's next retry
+    // (up to 2.4 s). So 12.6 s to 19.8 s.
+    assert!(took >= Duration::from_millis(12_500), "too early: {took:?}");
+    assert!(took <= S(20), "too late: {took:?}");
+    let rec = api.lease(NS, LEASE).unwrap();
+    assert!(rec.held_by("b"));
+    assert_eq!(rec.transitions, 1);
+    b.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn graceful_release_hands_over_fast() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    let b = elect(&api, "b");
+    advance(S(3)).await;
+    let la = a.leadership();
+    a.stop().await;
+    assert!(!la.is_leader());
+    let rec = api.lease(NS, LEASE).unwrap();
+    assert!(rec.is_free(), "released: {rec:?}");
+    assert_eq!(rec.lease_duration_secs, 1);
+    let t0 = Instant::now();
+    let lb = b.leadership();
+    wait_until(S(5), || lb.is_leader()).await;
+    assert!(
+        t0.elapsed() <= Duration::from_millis(2_500),
+        "{:?}",
+        t0.elapsed()
+    );
+    b.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_off_keeps_holder() {
+    let api = MemoryKubeApi::new();
+    let mut cfg = leader_config();
+    cfg.release_on_shutdown = false;
+    let a = LeaderElector::new(Arc::new(api.clone()), NS, "a", cfg)
+        .unwrap()
+        .start();
+    assert!(a.leadership().wait_until_leader().await);
+    a.stop().await;
+    assert!(api.lease(NS, LEASE).unwrap().held_by("a"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn api_outage_ends_belief_at_renew_deadline_then_recovers() {
+    let api = MemoryKubeApi::new();
+    let metrics = Arc::new(KubernetesMetrics::new());
+    let a = LeaderElector::new(Arc::new(api.clone()), NS, "a", leader_config())
+        .unwrap()
+        .with_metrics(Arc::clone(&metrics))
+        .start();
+    let la = a.leadership();
+    assert!(la.wait_until_leader().await);
+    advance(S(3)).await;
+    api.set_down(true);
+    advance(Duration::from_millis(7_500)).await;
+    assert!(la.is_leader(), "belief lasts up to the renew deadline");
+    advance(Duration::from_millis(2_600)).await;
+    assert!(!la.is_leader(), "belief ends at the renew deadline");
+    assert!(metrics.snapshot().lease_errors >= 3);
+    api.set_down(false);
+    wait_until(S(5), || la.is_leader()).await;
+    assert_eq!(api.lease(NS, LEASE).unwrap().transitions, 0, "same holder");
+    let s = metrics.snapshot();
+    assert_eq!((s.leader_acquired, s.leader_lost), (2, 1));
+    assert_eq!(s.lease.as_deref(), Some(LEASE));
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_api_call_ends_belief_at_renew_deadline() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    assert!(la.wait_until_leader().await);
+    api.set_latency(S(60));
+    let t0 = Instant::now();
+    wait_until(S(20), || !la.is_leader()).await;
+    assert!(
+        t0.elapsed() <= Duration::from_millis(10_100),
+        "{:?}",
+        t0.elapsed()
+    );
+    api.set_latency(Duration::ZERO);
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn other_holder_ends_belief_at_once_then_expires() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    assert!(la.wait_until_leader().await);
+    let mut intruder = api.lease(NS, LEASE).unwrap();
+    intruder.holder = Some("intruder".into());
+    api.put_lease(NS, LEASE, intruder);
+    wait_until(Duration::from_millis(2_500), || !la.is_leader()).await;
+    assert_eq!(la.holder().as_deref(), Some("intruder"));
+    // The intruder never renews. `a` takes over after 15 s.
+    let t0 = Instant::now();
+    wait_until(S(20), || la.is_leader()).await;
+    assert!(t0.elapsed() >= S(12), "{:?}", t0.elapsed());
+    assert_eq!(api.lease(NS, LEASE).unwrap().transitions, 1);
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn record_duration_from_another_holder_is_used() {
+    let api = MemoryKubeApi::new();
+    api.put_lease(
+        NS,
+        LEASE,
+        LeaseRecord {
+            holder: Some("old".into()),
+            lease_duration_secs: 30,
+            ..LeaseRecord::default()
+        },
+    );
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    advance(S(25)).await;
+    assert!(!la.is_leader(), "30 s lease is still live");
+    wait_until(S(10), || la.is_leader()).await;
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn free_lease_is_taken_at_once() {
+    let api = MemoryKubeApi::new();
+    api.put_lease(
+        NS,
+        LEASE,
+        LeaseRecord {
+            holder: None,
+            lease_duration_secs: 15,
+            transitions: 4,
+            ..LeaseRecord::default()
+        },
+    );
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    assert_eq!(api.lease(NS, LEASE).unwrap().transitions, 5);
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn forbidden_never_leads_and_counts_errors() {
+    let api = MemoryKubeApi::new();
+    api.set_leases_forbidden(true);
+    let metrics = Arc::new(KubernetesMetrics::new());
+    let a = LeaderElector::new(Arc::new(api.clone()), NS, "a", leader_config())
+        .unwrap()
+        .with_metrics(Arc::clone(&metrics))
+        .start();
+    advance(S(10)).await;
+    assert!(!a.leadership().is_leader());
+    assert!(metrics.snapshot().lease_errors >= 3);
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_candidates_never_overlap() {
+    let api = MemoryKubeApi::new();
+    let mut handles: Vec<Option<autumn_plugin_kubernetes::ElectorHandle>> = ["a", "b", "c"]
+        .iter()
+        .map(|id| Some(elect(&api, id)))
+        .collect();
+    let views: Vec<_> = handles
+        .iter()
+        .map(|h| h.as_ref().unwrap().leadership())
+        .collect();
+    let mut leaders_seen = std::collections::BTreeSet::new();
+    for step in 0..1_500u32 {
+        advance(Duration::from_millis(100)).await;
+        let leading: Vec<_> = views.iter().filter(|v| v.is_leader()).collect();
+        assert!(leading.len() <= 1, "two leaders at step {step}");
+        if let Some(l) = leading.first() {
+            leaders_seen.insert(l.identity().to_owned());
+        }
+        // Crash the leader at 20 s and at 60 s.
+        if step == 200 || step == 600 {
+            let idx = views.iter().position(Leadership::is_leader).unwrap();
+            handles[idx].take().unwrap().abort();
+        }
+    }
+    assert_eq!(leaders_seen.len(), 3, "{leaders_seen:?}");
+    assert!(views.iter().any(Leadership::is_leader));
+    assert_eq!(api.lease(NS, LEASE).unwrap().transitions, 2);
+    for h in handles.into_iter().flatten() {
+        h.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_and_subscribe() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    let mut rx = la.subscribe();
+    assert!(la.wait_until_leader().await);
+    assert!(rx.borrow_and_update().leading);
+    let b = elect(&api, "b");
+    let lb = b.leadership();
+    lb.wait_until_follower().await;
+    a.stop().await;
+    assert!(!rx.borrow().leading);
+    b.abort();
+    assert!(
+        !lb.wait_until_leader().await,
+        "stopped elector ends the wait"
+    );
+}
+
+#[test]
+fn new_rejects_bad_config() {
+    let api: Arc<dyn KubeApi> = Arc::new(MemoryKubeApi::new());
+    let mut cfg = leader_config();
+    cfg.renew_deadline_secs = 20;
+    assert!(matches!(
+        LeaderElector::new(Arc::clone(&api), NS, "a", cfg),
+        Err(KubeError::Config(_))
+    ));
+    let mut cfg = leader_config();
+    cfg.lease_name = "Bad".into();
+    assert!(LeaderElector::new(Arc::clone(&api), NS, "a", cfg).is_err());
+    assert!(LeaderElector::new(Arc::clone(&api), NS, "", leader_config()).is_err());
+    assert!(LeaderElector::new(Arc::clone(&api), "", "a", leader_config()).is_err());
+    let e = LeaderElector::new(api, NS, "a", leader_config()).unwrap();
+    assert!(format!("{e:?}").contains(LEASE));
+}
+
+// ------------------------------------------------------------ leader tasks
+
+#[derive(Default)]
+struct Counts {
+    started: AtomicU32,
+    stopped: AtomicU32,
+}
+
+fn counting_task(counts: &Arc<Counts>) -> LeaderTask {
+    let counts = Arc::clone(counts);
+    LeaderTask::new("count", move |_state: AppState, cancel| {
+        let counts = Arc::clone(&counts);
+        async move {
+            counts.started.fetch_add(1, Ordering::SeqCst);
+            cancel.cancelled().await;
+            counts.stopped.fetch_add(1, Ordering::SeqCst);
+        }
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn task_runs_only_while_leading_once_per_term() {
+    let api = MemoryKubeApi::new();
+    let b = elect(&api, "b");
+    assert!(b.leadership().wait_until_leader().await);
+    let a = elect(&api, "a");
+    let counts = Arc::new(Counts::default());
+    let tasks = LeaderTasks::start(
+        a.leadership(),
+        vec![counting_task(&counts)],
+        AppState::for_test(),
+        S(5),
+    );
+    advance(S(5)).await;
+    assert_eq!(
+        counts.started.load(Ordering::SeqCst),
+        0,
+        "follower runs nothing"
+    );
+    b.stop().await;
+    let la = a.leadership();
+    wait_until(S(5), || counts.started.load(Ordering::SeqCst) == 1).await;
+    assert!(la.is_leader());
+    // Lose the lease: the token fires.
+    let mut intruder = api.lease(NS, LEASE).unwrap();
+    intruder.holder = Some("intruder".into());
+    api.put_lease(NS, LEASE, intruder);
+    wait_until(S(5), || counts.stopped.load(Ordering::SeqCst) == 1).await;
+    // Next term: one more run.
+    wait_until(S(20), || counts.started.load(Ordering::SeqCst) == 2).await;
+    tasks.stop().await;
+    assert_eq!(
+        counts.stopped.load(Ordering::SeqCst),
+        2,
+        "stop cancels the task"
+    );
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stuck_task_is_aborted_after_timeout() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let started = Arc::new(AtomicU32::new(0));
+    let s2 = Arc::clone(&started);
+    let stuck = LeaderTask::new("stuck", move |_state: AppState, _cancel| {
+        let s2 = Arc::clone(&s2);
+        async move {
+            s2.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    });
+    assert_eq!(stuck.name(), "stuck");
+    assert!(format!("{stuck:?}").contains("stuck"));
+    let tasks = LeaderTasks::start(a.leadership(), vec![stuck], AppState::for_test(), S(1));
+    wait_until(S(5), || started.load(Ordering::SeqCst) == 1).await;
+    let t0 = Instant::now();
+    tasks.stop().await;
+    assert!(
+        t0.elapsed() <= Duration::from_millis(1_100),
+        "{:?}",
+        t0.elapsed()
+    );
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn task_that_returns_waits_for_next_term() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let runs = Arc::new(AtomicU32::new(0));
+    let r2 = Arc::clone(&runs);
+    let once = LeaderTask::new("once", move |_state: AppState, _cancel| {
+        let r2 = Arc::clone(&r2);
+        async move {
+            r2.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let tasks = LeaderTasks::start(a.leadership(), vec![once], AppState::for_test(), S(1));
+    advance(S(10)).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    tasks.stop().await;
+    a.stop().await;
+}
+
+// ------------------------------------------------- review round 1 (safety)
+
+#[tokio::test(start_paused = true)]
+async fn supervisor_stops_when_elector_dies_while_leading() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let counts = Arc::new(Counts::default());
+    let tasks = LeaderTasks::start(
+        a.leadership(),
+        vec![counting_task(&counts)],
+        AppState::for_test(),
+        S(1),
+    );
+    wait_until(S(5), || counts.started.load(Ordering::SeqCst) == 1).await;
+    a.abort();
+    advance(S(5)).await;
+    assert_eq!(counts.started.load(Ordering::SeqCst), 1, "no restart loop");
+    assert_eq!(counts.stopped.load(Ordering::SeqCst), 1, "task cancelled");
+    tasks.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn belief_counts_from_the_time_the_write_was_sent() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    assert!(la.wait_until_leader().await);
+    // The next write lands at once, but its reply is 6 s late.
+    api.set_write_reply_delay(S(6));
+    let before = api.lease_writes();
+    wait_until(S(5), || api.lease_writes() > before).await;
+    let landed = Instant::now();
+    // After that, every call hangs.
+    api.set_latency(S(1_000));
+    tokio::time::sleep_until(landed + Duration::from_millis(9_900)).await;
+    assert!(la.is_leader(), "belief lasts renew_deadline after the send");
+    tokio::time::sleep_until(landed + Duration::from_millis(10_050)).await;
+    assert!(!la.is_leader(), "belief must not count from the late reply");
+    api.set_latency(Duration::ZERO);
+    api.set_write_reply_delay(Duration::ZERO);
+    a.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn write_conflict_ends_belief_at_once() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    assert!(la.wait_until_leader().await);
+    api.conflict_lease_writes(1);
+    let mut rx = la.subscribe();
+    tokio::time::timeout(Duration::from_millis(2_600), rx.wait_for(|s| !s.leading))
+        .await
+        .expect("conflict ends belief within one retry")
+        .unwrap();
+    // The record still names `a`, so the next tick renews.
+    wait_until(S(5), || la.is_leader()).await;
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn renew_rewrites_the_lease_duration() {
+    let api = MemoryKubeApi::new();
+    api.put_lease(
+        NS,
+        LEASE,
+        LeaseRecord {
+            holder: Some("a".into()),
+            lease_duration_secs: 3,
+            ..LeaseRecord::default()
+        },
+    );
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    assert_eq!(api.lease(NS, LEASE).unwrap().lease_duration_secs, 15);
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn huge_record_duration_is_capped() {
+    let api = MemoryKubeApi::new();
+    api.put_lease(
+        NS,
+        LEASE,
+        LeaseRecord {
+            holder: Some("squatter".into()),
+            lease_duration_secs: i32::MAX,
+            ..LeaseRecord::default()
+        },
+    );
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    // Cap: 1 hour (policy::MAX_LEASE_MS), not 68 years.
+    wait_until(S(3_700), || la.is_leader()).await;
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_elector_handle_stops_renewing() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    drop(a);
+    advance(S(1)).await;
+    let writes = api.lease_writes();
+    advance(S(10)).await;
+    assert_eq!(api.lease_writes(), writes, "no renews after drop");
+    // A drop does not release: leader tasks may still run. The lease
+    // expires after lease_duration, which is longer than the stop timeout.
+    assert!(
+        api.lease(NS, LEASE).unwrap().held_by("a"),
+        "not released on drop"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_task_supervisor_cancels_tasks() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let counts = Arc::new(Counts::default());
+    let tasks = LeaderTasks::start(
+        a.leadership(),
+        vec![counting_task(&counts)],
+        AppState::for_test(),
+        S(1),
+    );
+    wait_until(S(5), || counts.started.load(Ordering::SeqCst) == 1).await;
+    drop(tasks);
+    wait_until(S(2), || counts.stopped.load(Ordering::SeqCst) == 1).await;
+    a.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn huge_stop_timeout_does_not_panic() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let counts = Arc::new(Counts::default());
+    let tasks = LeaderTasks::start(
+        a.leadership(),
+        vec![counting_task(&counts)],
+        AppState::for_test(),
+        Duration::MAX,
+    );
+    wait_until(S(5), || counts.started.load(Ordering::SeqCst) == 1).await;
+    tasks.stop().await;
+    assert_eq!(counts.stopped.load(Ordering::SeqCst), 1);
+    a.stop().await;
+}
+
+/// A starved elector runtime must not leave a stale "leading" view: belief is
+/// bound to a deadline that readers check on their own clock.
+#[test]
+fn is_leader_ends_at_deadline_even_if_the_elector_is_starved() {
+    use std::sync::mpsc;
+    let api = MemoryKubeApi::new();
+    let (tx, rx) = mpsc::channel();
+    let (block_tx, block_rx) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let cfg = autumn_plugin_kubernetes::config::LeaderElectionConfig {
+                lease_duration_secs: 3,
+                renew_deadline_secs: 2,
+                retry_period_secs: 1,
+                ..leader_config()
+            };
+            let h = LeaderElector::new(Arc::new(api), NS, "a", cfg)
+                .unwrap()
+                .start();
+            assert!(h.leadership().wait_until_leader().await);
+            tx.send(h.leadership()).unwrap();
+            // Block the only worker thread: the elector cannot run.
+            block_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_secs(4));
+            h.abort();
+        });
+    });
+    let lead = rx.recv().unwrap();
+    assert!(lead.is_leader());
+    block_tx.send(()).unwrap();
+    let blocked_at = std::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(2_300));
+    assert!(
+        !lead.is_leader(),
+        "still leading {:?} after the elector stopped running",
+        blocked_at.elapsed()
+    );
+    worker.join().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_failure_is_counted_and_stop_still_ends() {
+    let api = MemoryKubeApi::new();
+    let metrics = Arc::new(KubernetesMetrics::new());
+    let a = LeaderElector::new(Arc::new(api.clone()), NS, "a", leader_config())
+        .unwrap()
+        .with_metrics(Arc::clone(&metrics))
+        .start();
+    assert!(a.leadership().wait_until_leader().await);
+    let before = metrics.snapshot().lease_errors;
+    api.set_down(true);
+    a.stop().await;
+    assert!(
+        metrics.snapshot().lease_errors > before,
+        "release error counted"
+    );
+    assert!(api.lease(NS, LEASE).unwrap().held_by("a"), "not released");
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_skips_a_lease_that_another_replica_holds() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    let mut other = api.lease(NS, LEASE).unwrap();
+    other.holder = Some("b".into());
+    api.put_lease(NS, LEASE, other);
+    a.stop().await;
+    assert!(api.lease(NS, LEASE).unwrap().held_by("b"), "b keeps it");
+}
+
+/// CI found it: two replicas that start together both create the lease. The
+/// loser's 409 is a normal race, not an error.
+#[tokio::test(start_paused = true)]
+async fn a_lost_create_race_is_a_conflict_not_an_error() {
+    let api = MemoryKubeApi::new();
+    // Both GETs see no lease before either create lands.
+    api.set_latency(Duration::from_millis(100));
+    let (ma, mb) = (
+        Arc::new(KubernetesMetrics::new()),
+        Arc::new(KubernetesMetrics::new()),
+    );
+    let a = LeaderElector::new(Arc::new(api.clone()), NS, "a", leader_config())
+        .unwrap()
+        .with_metrics(Arc::clone(&ma))
+        .start();
+    let b = LeaderElector::new(Arc::new(api.clone()), NS, "b", leader_config())
+        .unwrap()
+        .with_metrics(Arc::clone(&mb))
+        .start();
+    advance(S(5)).await;
+    let (sa, sb) = (ma.snapshot(), mb.snapshot());
+    assert_eq!(
+        sa.lease_errors + sb.lease_errors,
+        0,
+        "a race is not an error"
+    );
+    assert_eq!(
+        sa.lease_conflicts + sb.lease_conflicts,
+        1,
+        "one side lost the race"
+    );
+    a.stop().await;
+    b.stop().await;
+}
+
+/// Review round 2: a dead elector that was leading never reads as leader,
+/// also through `wait_until_leader`.
+#[tokio::test(start_paused = true)]
+async fn wait_until_leader_is_false_after_the_leader_elector_dies() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    assert!(la.wait_until_leader().await);
+    a.abort();
+    tokio::task::yield_now().await;
+    assert!(!la.wait_until_leader().await);
+    assert!(!la.is_leader());
+}
+
+/// Review round 2: leader tasks stop at the belief deadline even when the
+/// elector cannot run (its runtime is blocked).
+#[test]
+fn tasks_stop_at_deadline_even_if_the_elector_is_starved() {
+    use std::sync::mpsc;
+    let api = MemoryKubeApi::new();
+    let (tx, rx) = mpsc::channel();
+    let (block_tx, block_rx) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let cfg = autumn_plugin_kubernetes::config::LeaderElectionConfig {
+                lease_duration_secs: 3,
+                renew_deadline_secs: 2,
+                retry_period_secs: 1,
+                ..leader_config()
+            };
+            let h = LeaderElector::new(Arc::new(api), NS, "a", cfg)
+                .unwrap()
+                .start();
+            assert!(h.leadership().wait_until_leader().await);
+            tx.send(h.leadership()).unwrap();
+            block_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_secs(4));
+            h.abort();
+        });
+    });
+    let lead = rx.recv().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancelled_after = rt.block_on(async move {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+        let task = LeaderTask::new("t", move |_s: AppState, cancel| {
+            let done_tx = Arc::clone(&done_tx);
+            async move {
+                cancel.cancelled().await;
+                let tx = done_tx.lock().unwrap().take();
+                if let Some(tx) = tx {
+                    let _ = tx.send(std::time::Instant::now());
+                }
+            }
+        });
+        let tasks = LeaderTasks::start(lead, vec![task], AppState::for_test(), S(1));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        block_tx.send(()).unwrap();
+        let blocked_at = std::time::Instant::now();
+        let at = tokio::time::timeout(S(5), done_rx).await.unwrap().unwrap();
+        tasks.stop().await;
+        at.duration_since(blocked_at)
+    });
+    assert!(
+        cancelled_after < Duration::from_millis(2_300),
+        "{cancelled_after:?}"
+    );
+    worker.join().unwrap();
+}
