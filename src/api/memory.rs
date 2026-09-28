@@ -315,6 +315,9 @@ impl KubeApi for MemoryKubeApi {
         namespace: &str,
         name: &str,
     ) -> BoxStream<'static, Result<ConfigMapEvent, KubeError>> {
+        if self.lock().down {
+            return Box::pin(futures::stream::once(async { Err(down_error()) }));
+        }
         let rx = self.config_map_sender(namespace, name).subscribe();
         // First item: the current state. Then one item per change.
         Box::pin(futures::stream::unfold(
