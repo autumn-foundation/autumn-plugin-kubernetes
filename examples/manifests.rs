@@ -29,10 +29,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // With no profile, autumn uses dev (1 s shutdown timeout). That gives a
     // grace period far too short for the pods. Ask for the pod profile.
+    // Like autumn: an empty value selects no profile.
+    let raw: Vec<String> = std::env::args().collect();
+    let flag_value = raw.iter().enumerate().find_map(|(i, a)| {
+        a.strip_prefix("--profile=").map(str::to_owned).or_else(|| {
+            (a == "--profile")
+                .then(|| raw.get(i + 1).cloned())
+                .flatten()
+        })
+    });
     let profile_set = ["AUTUMN_ENV", "AUTUMN_PROFILE"]
         .iter()
         .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
-        || std::env::args().any(|a| a == "--profile" || a.starts_with("--profile="));
+        || flag_value.is_some_and(|v| !v.trim().is_empty());
     if !profile_set {
         eprintln!(
             "manifests: choose the profile that the pods run with: --profile prod \

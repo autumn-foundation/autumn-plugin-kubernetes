@@ -94,6 +94,15 @@ impl KubernetesHealth {
         result
     }
 
+    /// Time until the stored result is old. Zero when there is none.
+    pub(crate) async fn until_stale(&self) -> Duration {
+        let cache = self.cache.lock().await;
+        cache.map_or(Duration::ZERO, |(at, result)| {
+            let ttl = if result.is_ok() { UP_TTL } else { DOWN_TTL };
+            ttl.saturating_sub(at.elapsed())
+        })
+    }
+
     /// The cached result, or a new check when the cached one is old. One
     /// check at a time.
     async fn api_status(&self) -> Result<(), &'static str> {
@@ -362,6 +371,23 @@ mod tests {
         assert_eq!(second.status, HealthStatus::Up);
         first.await.unwrap();
         refresh.await.unwrap();
+    }
+
+    /// Round 3: the background loop sleeps until the result is old, so the
+    /// metric is never older than about one TTL.
+    #[tokio::test(start_paused = true)]
+    async fn next_refresh_waits_only_for_the_rest_of_the_ttl() {
+        let api = MemoryKubeApi::new();
+        let (h, _) = health(false);
+        h.set(target(Some(Arc::new(api)), "in_cluster"));
+        assert_eq!(h.until_stale().await, Duration::ZERO, "no result yet");
+        h.refresh().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            h.until_stale().await,
+            Duration::from_secs(2),
+            "UP_TTL is 5 s"
+        );
     }
 
     #[test]

@@ -92,8 +92,9 @@ pub(crate) const fn mode_for(kubeconfig_present: bool) -> &'static str {
     }
 }
 
-/// `true` when a kubeconfig file exists: a path in `KUBECONFIG` (a list), or
-/// `~/.kube/config` when `KUBECONFIG` is not set. kube reads it first.
+/// `true` when kube will read a kubeconfig: `KUBECONFIG` has a non-empty
+/// entry (also a missing file, so a typo is an error and not detached mode),
+/// else `~/.kube/config` exists. kube reads it before the in-cluster config.
 pub(crate) fn kubeconfig_present() -> bool {
     kubeconfig_file_exists(
         std::env::var_os("KUBECONFIG").as_deref(),
@@ -105,13 +106,12 @@ pub(crate) fn kubeconfig_file_exists(
     kubeconfig: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> bool {
-    kubeconfig.filter(|v| !v.is_empty()).map_or_else(
-        || home.is_some_and(|h| std::path::Path::new(h).join(".kube/config").is_file()),
-        |list| std::env::split_paths(list).any(|p| p.is_file()),
-    )
+    let listed = kubeconfig
+        .is_some_and(|list| std::env::split_paths(list).any(|p| !p.as_os_str().is_empty()));
+    listed || home.is_some_and(|h| std::path::Path::new(h).join(".kube/config").is_file())
 }
 
-/// Query keys whose values `scrub` hides.
+/// Keys whose values `scrub` hides (ASCII case is ignored).
 const SECRET_KEYS: [&str; 5] = [
     "token=",
     "access_token=",
@@ -120,22 +120,37 @@ const SECRET_KEYS: [&str; 5] = [
     "api_key=",
 ];
 
-/// Removes credentials from error text: URL user info
+/// Auth schemes whose next word `scrub` hides (ASCII case is ignored).
+const AUTH_SCHEMES: [&str; 2] = ["bearer", "basic"];
+
+/// Removes known credential forms from error text: URL user info
 /// (`scheme://user:pass@host` to `scheme://***@host`, also with no scheme),
-/// secret query values, and bearer tokens. It works on words (split at
-/// white space). It can hide more than necessary, never less.
+/// secret query values, and `Bearer`/`Basic` credentials. It works on words
+/// (split at white space). It is a best effort for text from libraries: do
+/// not rely on it for text that you know holds a secret.
 pub(crate) fn scrub(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut after_bearer = false;
+    let mut after_scheme = false;
     for piece in text.split_inclusive(char::is_whitespace) {
         let word = piece.trim_end_matches(char::is_whitespace);
         let space = &piece[word.len()..];
-        let clean = if after_bearer && !word.is_empty() {
+        if word.is_empty() {
+            // More white space: the next word is still the credential.
+            out.push_str(space);
+            continue;
+        }
+        let clean = if after_scheme {
             "***".to_owned()
         } else {
             scrub_word(word)
         };
-        after_bearer = word.eq_ignore_ascii_case("bearer");
+        // `"Bearer`, `{"Authorization":"Bearer` and `'Bearer` end in the
+        // scheme name after the last non-letter.
+        let tail = word
+            .rsplit(|c: char| !c.is_ascii_alphanumeric())
+            .find(|w| !w.is_empty())
+            .unwrap_or("");
+        after_scheme = AUTH_SCHEMES.iter().any(|s| tail.eq_ignore_ascii_case(s));
         out.push_str(&clean);
         out.push_str(space);
     }
@@ -161,7 +176,8 @@ fn scrub_word(word: &str) -> String {
     let mut w = hide_user_info(word);
     for key in SECRET_KEYS {
         let mut from = 0;
-        while let Some(i) = w[from..].find(key) {
+        // ASCII lower case keeps byte positions, so indices match `w`.
+        while let Some(i) = w[from..].to_ascii_lowercase().find(key) {
             let start = from + i + key.len();
             let end = w[start..]
                 .find(['&', '"', '\''])
@@ -503,6 +519,16 @@ mod tests {
             "header Bearer *** rejected"
         );
         assert_eq!(scrub("\"https://u:p@h\""), "\"https://***@h\"");
+        // Round 3: more forms.
+        assert_eq!(scrub("Bearer  abc"), "Bearer  ***");
+        assert_eq!(
+            scrub(r#"{"Authorization":"Bearer abc"}"#),
+            r#"{"Authorization":"Bearer ***"#
+        );
+        assert_eq!(scrub("'Bearer abc'"), "'Bearer ***");
+        assert_eq!(scrub("Basic dXNlcjpwYXNz"), "Basic ***");
+        assert_eq!(scrub("url?Token=abc&x=1"), "url?Token=***&x=1");
+        assert_eq!(scrub("PASSWORD=hunter2"), "PASSWORD=***");
         // Not credentials: stay as they are.
         assert_eq!(scrub("mail me@example.com"), "mail me@example.com");
         assert_eq!(scrub("https://[::1]:6443/x"), "https://[::1]:6443/x");
@@ -522,30 +548,32 @@ mod tests {
     }
 
     #[test]
-    fn kubeconfig_presence_needs_a_file() {
+    fn kubeconfig_presence_follows_kube() {
         use std::ffi::OsStr;
         let dir = std::env::temp_dir().join(format!("akp-kc-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".kube")).unwrap();
-        let file = dir.join("kc");
-        std::fs::write(&file, "").unwrap();
-        let list = std::env::join_paths([dir.join("missing"), file]).unwrap();
+        let home = Some(dir.as_os_str());
+        // A set KUBECONFIG with a non-empty entry is a config the user wants,
+        // also when the file is missing (a typo): kube fails on it.
+        assert!(kubeconfig_file_exists(Some(OsStr::new("/typo")), home));
+        assert!(kubeconfig_file_exists(Some(OsStr::new("/no/such")), None));
+        // Empty entries are skipped; with none left, home applies.
+        let sep = if cfg!(windows) { ";" } else { ":" };
         assert!(
-            kubeconfig_file_exists(Some(&list), None),
-            "any path in the list"
+            !kubeconfig_file_exists(Some(OsStr::new(sep)), home),
+            "no home file yet"
         );
-        assert!(!kubeconfig_file_exists(
-            Some(OsStr::new("/no/such")),
-            Some(dir.as_os_str())
-        ));
-        assert!(
-            !kubeconfig_file_exists(None, Some(dir.as_os_str())),
-            "no ~/.kube/config"
-        );
+        assert!(!kubeconfig_file_exists(Some(OsStr::new("")), home));
+        assert!(!kubeconfig_file_exists(None, home), "no ~/.kube/config");
         std::fs::write(dir.join(".kube/config"), "").unwrap();
-        assert!(kubeconfig_file_exists(None, Some(dir.as_os_str())));
+        assert!(kubeconfig_file_exists(None, home));
         assert!(
-            kubeconfig_file_exists(Some(OsStr::new("")), Some(dir.as_os_str())),
+            kubeconfig_file_exists(Some(OsStr::new("")), home),
             "empty: home"
+        );
+        assert!(
+            kubeconfig_file_exists(Some(OsStr::new(sep)), home),
+            "only separators: home"
         );
         assert!(!kubeconfig_file_exists(None, None));
         std::fs::remove_dir_all(dir).unwrap();
