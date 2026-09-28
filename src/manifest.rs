@@ -80,6 +80,8 @@ pub struct ManifestSpec {
     pub config_maps: Vec<String>,
     /// The app writes Kubernetes Events.
     pub events: bool,
+    /// The plugin talks to the API. Mounts the service account token.
+    pub api_access: bool,
     /// Extra env vars.
     pub env: BTreeMap<String, String>,
 }
@@ -118,6 +120,7 @@ impl ManifestSpec {
             lease_name: None,
             config_maps: Vec::new(),
             events: true,
+            api_access: true,
             env: BTreeMap::new(),
         }
     }
@@ -144,6 +147,7 @@ impl ManifestSpec {
             s.namespace.clone_from(&kube.namespace);
         }
         s.events = kube.enabled && kube.events;
+        s.api_access = kube.enabled;
         if kube.enabled {
             if kube.leader_election.enabled {
                 s.lease_name = Some(kube.leader_election.lease_name.clone());
@@ -313,22 +317,22 @@ impl ManifestSpec {
             };
         let mut rules = Vec::new();
         if let Some(lease) = &self.lease_name {
-            // `create` cannot be limited by name.
-            rules.push(rule("coordination.k8s.io", "leases", &["create"], None));
+            // The elector creates with PUT (create on update), so `create`
+            // is limited by name too. Renew and release use a merge patch.
             rules.push(rule(
                 "coordination.k8s.io",
                 "leases",
-                &["get", "update"],
+                &["create", "get", "patch", "update"],
                 Some(vec![lease.clone()]),
             ));
         }
         if !self.config_maps.is_empty() {
             // The watch uses a `metadata.name` field selector, so names apply
-            // to list and watch too.
+            // to list and watch. It makes no get call.
             rules.push(rule(
                 "",
                 "configmaps",
-                &["get", "list", "watch"],
+                &["list", "watch"],
                 Some(self.config_maps.clone()),
             ));
         }
@@ -419,7 +423,8 @@ impl ManifestSpec {
     }
 
     fn deployment(&self) -> Deployment {
-        let needs_token = !self.rules().is_empty();
+        // The plugin needs the token to find the cluster, also with no rules.
+        let needs_token = self.api_access || !self.rules().is_empty();
         let lifecycle = (self.prestop_hook_secs > 0).then(|| Lifecycle {
             pre_stop: Some(LifecycleHandler {
                 // `sleep` needs no shell in the image.

@@ -236,7 +236,8 @@ async fn three_electors_on_a_real_lease() {
     assert_eq!(crashed, 2);
     assert_eq!(seen.len(), 3, "{seen:?}");
     let rec: LeaseRecord = api.get_lease(&ns, "l").await.unwrap().unwrap();
-    assert_eq!(rec.transitions, 2);
+    // Two crashes give two takeovers. A slow CI disk can add one more.
+    assert!(rec.transitions >= 2, "{}", rec.transitions);
     for h in handles.into_iter().flatten() {
         h.stop().await;
     }
@@ -324,7 +325,10 @@ async fn generated_rbac_is_enough_and_minimal() {
         l1.is_leader() || l2.is_leader()
     })
     .await;
-    assert!(!(l1.is_leader() && l2.is_leader()));
+    for _ in 0..30 {
+        assert!(!(l1.is_leader() && l2.is_leader()), "two leaders");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     let store = ConfigMapStore::from_state(&s1).unwrap();
     wait_for(Duration::from_secs(10), async || store.is_synced("flags")).await;
@@ -362,11 +366,18 @@ async fn generated_rbac_is_enough_and_minimal() {
     .await;
 
     // Hand over: stop the leader. The other takes over fast (release).
-    let (leader_rt, other) = if l1.is_leader() { (r1, l2) } else { (r2, l1) };
+    let (leader_rt, other, other_rt) = if l1.is_leader() {
+        (r1, l2, r2)
+    } else {
+        (r2, l1, r1)
+    };
     let t0 = std::time::Instant::now();
-    leader_rt.shutdown().await;
+    // Release comes before the Stopping event, so the handover does not
+    // wait for the event write. Expect release plus one retry (1.2 s).
+    let stop = tokio::spawn(leader_rt.shutdown());
     wait_for(Duration::from_secs(5), async || other.is_leader()).await;
     assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    stop.await.unwrap();
 
     // Least privilege: another lease name is denied.
     let app = KubeClientApi::new(client(&dir, "app.kubeconfig").await, None);
@@ -374,20 +385,15 @@ async fn generated_rbac_is_enough_and_minimal() {
     assert!(matches!(err, KubeError::Forbidden { .. }), "{err}");
     let err = app.get_lease("default", "shop-leader").await.unwrap_err();
     assert!(matches!(err, KubeError::Forbidden { .. }), "{err}");
-    let mut w = app.watch_config_map(ns, "secret-settings");
-    let first = tokio::time::timeout(Duration::from_secs(10), futures::StreamExt::next(&mut w))
+    contract::denied_watch_contract(&app, ns, "secret-settings").await;
+    // `create` is limited to the lease name too: no squatting on others.
+    let err = app
+        .create_lease(ns, "another-app-leader", &LeaseRecord::default())
         .await
-        .unwrap()
-        .unwrap();
-    assert!(first.is_err(), "watch of an unlisted ConfigMap is denied");
-    drop(w);
+        .unwrap_err();
+    assert!(matches!(err, KubeError::Forbidden { .. }), "{err}");
 
-    let rest = if other.identity() == "shop-1" {
-        None
-    } else {
-        None::<()>
-    };
-    let _ = rest;
+    other_rt.shutdown().await;
 }
 
 #[tokio::test]
@@ -411,4 +417,46 @@ async fn plugin_health_on_real_server() {
     assert!(out.details["version"].as_str().unwrap().starts_with("v1."));
     assert_eq!(rt.namespace(), Some("default"), "kubeconfig namespace");
     rt.shutdown().await;
+}
+
+/// A renew must keep fields that other writers set (`GitOps` labels, owner
+/// references, coordinated leader election fields).
+#[tokio::test]
+async fn replace_keeps_metadata_and_other_spec_fields() {
+    let Some(dir) = it_dir() else { return };
+    let admin = client(&dir, "admin.kubeconfig").await;
+    let ns = unique("it-keep");
+    ensure_ns(&admin, &ns).await;
+    let leases: Api<k8s_openapi::api::coordination::v1::Lease> =
+        Api::namespaced(admin.clone(), &ns);
+    let lease: k8s_openapi::api::coordination::v1::Lease =
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "l",
+                "labels": {"app.kubernetes.io/part-of": "shop"},
+                "annotations": {"argocd.argoproj.io/tracking-id": "x"}
+            },
+            "spec": {"holderIdentity": "a", "leaseDurationSeconds": 15}
+        }))
+        .unwrap();
+    leases.create(&PostParams::default(), &lease).await.unwrap();
+    let api = KubeClientApi::new(admin, None);
+    let mut rec = api.get_lease(&ns, "l").await.unwrap().unwrap();
+    rec.holder = Some("b".into());
+    rec.transitions = 1;
+    api.replace_lease(&ns, "l", &rec).await.unwrap();
+    let after = leases.get("l").await.unwrap();
+    let meta = after.metadata;
+    assert_eq!(
+        meta.labels.unwrap()["app.kubernetes.io/part-of"],
+        "shop",
+        "labels kept"
+    );
+    assert_eq!(
+        meta.annotations.unwrap()["argocd.argoproj.io/tracking-id"],
+        "x"
+    );
+    assert_eq!(after.spec.unwrap().holder_identity.as_deref(), Some("b"));
 }

@@ -61,13 +61,13 @@ pub async fn lease_contract(api: &dyn KubeApi, ns: &str, name: &str) {
     let freed = api.replace_lease(ns, name, &free).await.unwrap();
     assert!(freed.is_free());
 
-    // Leases allow create on update: a replace of a missing Lease creates it.
+    // A replace is a patch with a version check. It does not create.
     let missing = format!("{name}-missing");
     let mut ghost = record("a");
     ghost.resource_version = Some("1".into());
-    let made = api.replace_lease(ns, &missing, &ghost).await.unwrap();
-    assert!(made.held_by("a"));
-    assert_eq!(api.get_lease(ns, &missing).await.unwrap(), Some(made));
+    let err = api.replace_lease(ns, &missing, &ghost).await.unwrap_err();
+    assert!(matches!(err, KubeError::NotFound(_)), "missing: {err}");
+    assert_eq!(api.get_lease(ns, &missing).await.unwrap(), None);
 }
 
 /// ConfigMap watch rules: first item is the state, then each change. A
@@ -126,4 +126,20 @@ pub async fn event_contract(api: &dyn KubeApi, ns: &str, pod: &str) {
     };
     api.publish_event(&pod, &ev).await.unwrap();
     assert!(api.server_version().await.unwrap().starts_with('v'));
+}
+
+/// A watch that RBAC denies yields `Forbidden` and stays open: it retries.
+pub async fn denied_watch_contract(api: &dyn KubeApi, ns: &str, name: &str) {
+    let mut w = api.watch_config_map(ns, name);
+    for n in 0..2 {
+        let item = tokio::time::timeout(Duration::from_secs(20), w.next())
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("stream ended at item {n}"));
+        let err = item.unwrap_err();
+        assert!(
+            matches!(err, KubeError::Forbidden { .. }),
+            "item {n}: {err}"
+        );
+    }
 }

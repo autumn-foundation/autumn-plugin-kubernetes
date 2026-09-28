@@ -11,7 +11,9 @@ use crate::error::KubeError;
 
 type Key = (String, String);
 
+/// Fake state. The flags are independent fault switches.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct State {
     leases: HashMap<Key, LeaseRecord>,
     next_version: u64,
@@ -25,6 +27,7 @@ struct State {
     latency: std::time::Duration,
     write_reply_delay: std::time::Duration,
     conflicting_lease_writes: u32,
+    forbidden_config_maps: bool,
 }
 
 /// In-memory fake of the Kubernetes API. Clones share state.
@@ -97,6 +100,7 @@ impl MemoryKubeApi {
     /// When `true`, every call fails like a network outage.
     pub fn set_down(&self, down: bool) {
         self.lock().down = down;
+        self.wake_watchers();
     }
 
     /// The next `n` Lease writes fail with an API error.
@@ -130,6 +134,35 @@ impl MemoryKubeApi {
 
     fn write_reply_delay(&self) -> std::time::Duration {
         self.lock().write_reply_delay
+    }
+
+    /// When `true`, ConfigMap watches fail with HTTP 403.
+    pub fn set_config_maps_forbidden(&self, forbidden: bool) {
+        self.lock().forbidden_config_maps = forbidden;
+        self.wake_watchers();
+    }
+
+    /// Wakes every watch, so it sees a changed fault state.
+    fn wake_watchers(&self) {
+        let senders: Vec<_> = self.lock().config_maps.values().cloned().collect();
+        for tx in senders {
+            tx.send_modify(|_| {});
+        }
+    }
+
+    /// The watch error now, if any.
+    fn watch_fault(&self) -> Option<KubeError> {
+        let s = self.lock();
+        if s.down {
+            Some(down_error())
+        } else if s.forbidden_config_maps {
+            Some(KubeError::Forbidden {
+                verb: "list".to_owned(),
+                resource: "configmaps".to_owned(),
+            })
+        } else {
+            None
+        }
     }
 
     /// When `true`, event writes fail.
@@ -255,11 +288,10 @@ impl MemoryKubeApi {
         let mut s = self.lock();
         Self::write_guard(&mut s, "update")?;
         let k = key(namespace, name);
+        // Like a merge patch with a version check: no create.
         let result = match s.leases.get(&k) {
-            // Like the API server: Leases allow create on update.
-            None if record.resource_version.is_some() => Ok(Self::store(&mut s, k, record)),
-            None => Err(KubeError::Conflict(format!(
-                "leases.coordination.k8s.io \"{name}\": no resourceVersion"
+            None => Err(KubeError::NotFound(format!(
+                "leases.coordination.k8s.io \"{name}\" not found"
             ))),
             Some(current)
                 if record.resource_version.is_none()
@@ -345,22 +377,38 @@ impl KubeApi for MemoryKubeApi {
         namespace: &str,
         name: &str,
     ) -> BoxStream<'static, Result<ConfigMapEvent, KubeError>> {
-        if self.lock().down {
-            return Box::pin(futures::stream::once(async { Err(down_error()) }));
-        }
+        // Like the kube watcher with backoff: the stream never ends. While a
+        // fault holds, it yields an error each second. After it, it yields
+        // the current state again (a relist).
         let rx = self.config_map_sender(namespace, name).subscribe();
-        // First item: the current state. Then one item per change.
+        let api = self.clone();
         Box::pin(futures::stream::unfold(
-            (rx, true),
-            |(mut rx, first)| async move {
-                if !first && rx.changed().await.is_err() {
-                    return None;
+            (rx, api, true, false),
+            |(mut rx, api, mut relist, mut erred)| async move {
+                loop {
+                    if let Some(err) = api.watch_fault() {
+                        if erred {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            if api.watch_fault().is_none() {
+                                continue;
+                            }
+                        }
+                        return Some((Err(err), (rx, api, true, true)));
+                    }
+                    if relist {
+                        let event = rx
+                            .borrow_and_update()
+                            .clone()
+                            .map_or(ConfigMapEvent::Deleted, ConfigMapEvent::Applied);
+                        return Some((Ok(event), (rx, api, false, false)));
+                    }
+                    erred = false;
+                    if rx.changed().await.is_err() {
+                        return None;
+                    }
+                    // A fault may have woken us. Loop to check it first.
+                    relist = api.watch_fault().is_none();
                 }
-                let event = rx
-                    .borrow_and_update()
-                    .clone()
-                    .map_or(ConfigMapEvent::Deleted, ConfigMapEvent::Applied);
-                Some((Ok(event), (rx, false)))
             },
         ))
     }
@@ -429,14 +477,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_missing_creates_like_the_api_server() {
+    async fn replace_missing_is_not_found() {
         let api = MemoryKubeApi::new();
-        let err = api.replace_lease("ns", "l", &rec("a")).await.unwrap_err();
-        assert!(matches!(err, KubeError::Conflict(_)), "no version: {err}");
         let mut with_version = rec("a");
         with_version.resource_version = Some("9".into());
-        let made = api.replace_lease("ns", "l", &with_version).await.unwrap();
-        assert!(made.held_by("a"));
+        let err = api
+            .replace_lease("ns", "l", &with_version)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KubeError::NotFound(_)), "{err}");
     }
 
     #[tokio::test]

@@ -182,11 +182,7 @@ impl KubernetesPlugin {
             ));
         }
         let api = KubeClientApi::connect(pod.name.clone()).await?;
-        let mode = if pod.in_cluster && std::env::var_os("KUBECONFIG").is_none() {
-            "in_cluster"
-        } else {
-            "kubeconfig"
-        };
+        let mode = crate::api::client_mode(crate::api::kubeconfig_present());
         Ok((Arc::new(api), mode))
     }
 

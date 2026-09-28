@@ -31,3 +31,10 @@ async fn memory_passes_event_contract() {
     contract::event_contract(&api, "ns", "p").await;
     assert_eq!(api.events().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn memory_passes_denied_watch_contract() {
+    let api = MemoryKubeApi::new();
+    api.set_config_maps_forbidden(true);
+    contract::denied_watch_contract(&api, "ns", "secret").await;
+}

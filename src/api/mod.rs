@@ -6,6 +6,7 @@
 
 mod client;
 pub use client::REPORTER;
+pub(crate) use client::{kubeconfig_present, mode_for as client_mode};
 mod memory;
 
 use std::collections::BTreeMap;

@@ -5,7 +5,7 @@ use futures::stream::BoxStream;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
-use kube::api::{Api, PostParams};
+use kube::api::{Api, Patch, PatchParams, PostParams};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::runtime::watcher;
@@ -54,7 +54,7 @@ impl KubeClientApi {
     pub async fn connect(instance: Option<String>) -> Result<Self, KubeError> {
         let config = kube::Config::infer()
             .await
-            .map_err(|e| KubeError::NoCluster(e.to_string()))?;
+            .map_err(|e| classify_infer_error(cluster_config_present(), &e.to_string()))?;
         let client = kube::Client::try_from(config).map_err(|e| map_error(&e, "", ""))?;
         Ok(Self::new(client, instance))
     }
@@ -64,25 +64,139 @@ impl KubeClientApi {
     }
 }
 
+/// `true` when this process has a kubeconfig or runs in a pod. Then a config
+/// error is a real error, not "no cluster".
+fn cluster_config_present() -> bool {
+    let kubeconfig_env = std::env::var_os("KUBECONFIG").is_some_and(|v| !v.is_empty());
+    let home_config = std::env::var_os("HOME")
+        .is_some_and(|h| std::path::Path::new(&h).join(".kube/config").exists());
+    let in_pod = std::env::var_os("KUBERNETES_SERVICE_HOST").is_some();
+    kubeconfig_env || home_config || in_pod
+}
+
+/// Config inference failed. With no kubeconfig and no pod, there is no
+/// cluster. With one of them, the config is bad: an error, not detached mode.
+pub(crate) fn classify_infer_error(config_present: bool, message: &str) -> KubeError {
+    let message = scrub(message);
+    if config_present {
+        KubeError::Api(format!(
+            "kubernetes config is present but not usable: {message}"
+        ))
+    } else {
+        KubeError::NoCluster(message)
+    }
+}
+
+/// The mode name. kube reads a kubeconfig first, then the in-cluster config.
+pub(crate) const fn mode_for(kubeconfig_present: bool) -> &'static str {
+    if kubeconfig_present {
+        "kubeconfig"
+    } else {
+        "in_cluster"
+    }
+}
+
+/// `true` when kube will use a kubeconfig file.
+pub(crate) fn kubeconfig_present() -> bool {
+    std::env::var_os("KUBECONFIG").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("HOME")
+            .is_some_and(|h| std::path::Path::new(&h).join(".kube/config").exists())
+}
+
+/// Removes URL user info (`scheme://user:pass@host` to `scheme://***@host`).
+pub(crate) fn scrub(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c == '/' || c == '"' || c == '\'' || c == ')' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        if let Some(at) = authority.rfind('@') {
+            out.push_str("***");
+            out.push_str(&authority[at..]);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Text for a `kube` error that is safe to log. Auth errors can hold exec
+/// plugin output; proxy errors can hold proxy credentials.
+pub(crate) fn describe(e: &kube::Error) -> String {
+    match e {
+        kube::Error::Auth(_) => "authentication failed".to_owned(),
+        kube::Error::ProxyProtocolDisabled { .. }
+        | kube::Error::ProxyProtocolUnsupported { .. } => {
+            "the proxy protocol is not supported (proxy URL hidden)".to_owned()
+        }
+        other => scrub(&other.to_string()),
+    }
+}
+
 /// Maps a `kube` error to a [`KubeError`]. `verb` and `resource` name the
 /// call for a 403.
 pub(crate) fn map_error(e: &kube::Error, verb: &str, resource: &str) -> KubeError {
     match e {
-        kube::Error::Api(status) if status.is_conflict() || status.is_already_exists() => {
-            KubeError::Conflict(status.message.clone())
-        }
-        kube::Error::Api(status) if status.is_not_found() => {
-            KubeError::NotFound(status.message.clone())
-        }
-        kube::Error::Api(status) if status.is_forbidden() => KubeError::Forbidden {
+        kube::Error::Api(status) => map_status(status, verb, resource),
+        other => KubeError::Api(describe(other)),
+    }
+}
+
+fn map_status(status: &kube::core::Status, verb: &str, resource: &str) -> KubeError {
+    if status.is_conflict() || status.is_already_exists() {
+        KubeError::Conflict(status.message.clone())
+    } else if status.is_not_found() {
+        KubeError::NotFound(status.message.clone())
+    } else if status.is_forbidden() {
+        KubeError::Forbidden {
             verb: verb.to_owned(),
             resource: resource.to_owned(),
-        },
-        other => KubeError::Api(other.to_string()),
+        }
+    } else {
+        KubeError::Api(scrub(&status.message))
+    }
+}
+
+/// Maps a watch error. A 403 on the list or the watch is `Forbidden`.
+pub(crate) fn map_watch_error(e: &watcher::Error, resource: &str) -> KubeError {
+    match e {
+        watcher::Error::InitialListFailed(k) => map_error(k, "list", resource),
+        watcher::Error::WatchStartFailed(k) | watcher::Error::WatchFailed(k) => {
+            map_error(k, "watch", resource)
+        }
+        watcher::Error::WatchError(status) => map_status(status, "watch", resource),
+        watcher::Error::NoResourceVersion => KubeError::Api(e.to_string()),
     }
 }
 
 const LEASES: &str = "leases.coordination.k8s.io";
+const CONFIG_MAPS: &str = "configmaps";
+
+/// The spec fields that the elector owns, as a JSON merge patch with a
+/// `resourceVersion` check. Other fields and all metadata stay as they are.
+pub(crate) fn lease_patch(record: &LeaseRecord) -> serde_json::Value {
+    let time = |t: Option<k8s_openapi::jiff::Timestamp>| {
+        t.map_or(serde_json::Value::Null, |t| {
+            serde_json::to_value(MicroTime(t)).unwrap_or(serde_json::Value::Null)
+        })
+    };
+    serde_json::json!({
+        "metadata": { "resourceVersion": record.resource_version },
+        "spec": {
+            "holderIdentity": record.holder.clone().filter(|h| !h.is_empty()),
+            "leaseDurationSeconds": record.lease_duration_secs,
+            "acquireTime": time(record.acquire_time),
+            "renewTime": time(record.renew_time),
+            "leaseTransitions": i32::try_from(record.transitions).unwrap_or(i32::MAX),
+        }
+    })
+}
 
 pub(crate) fn to_lease(name: &str, record: &LeaseRecord) -> Lease {
     Lease {
@@ -151,11 +265,21 @@ impl KubeApi for KubeClientApi {
         Box::pin(async move {
             let mut lease = to_lease(name, record);
             lease.metadata.resource_version = None;
+            // PUT with no version creates the Lease (create on update). RBAC
+            // can then limit `create` by name. If the Lease exists, the
+            // server says 422 "resourceVersion must be specified".
             self.leases(namespace)
-                .create(&PostParams::default(), &lease)
+                .replace(name, &PostParams::default(), &lease)
                 .await
                 .map(from_lease)
-                .map_err(|e| map_error(&e, "create", LEASES))
+                .map_err(|e| match &e {
+                    kube::Error::Api(s)
+                        if s.is_invalid() && s.message.contains("resourceVersion") =>
+                    {
+                        KubeError::Conflict(format!("lease {name} already exists"))
+                    }
+                    _ => map_error(&e, "create", LEASES),
+                })
         })
     }
 
@@ -172,10 +296,14 @@ impl KubeApi for KubeClientApi {
                 ));
             }
             self.leases(namespace)
-                .replace(name, &PostParams::default(), &to_lease(name, record))
+                .patch(
+                    name,
+                    &PatchParams::default(),
+                    &Patch::Merge(lease_patch(record)),
+                )
                 .await
                 .map(from_lease)
-                .map_err(|e| map_error(&e, "update", LEASES))
+                .map_err(|e| map_error(&e, "patch", LEASES))
         })
     }
 
@@ -206,7 +334,7 @@ impl KubeApi for KubeClientApi {
                         seen = false;
                         Some(Ok(ConfigMapEvent::Deleted))
                     }
-                    Err(e) => Some(Err(KubeError::Api(e.to_string()))),
+                    Err(e) => Some(Err(map_watch_error(&e, CONFIG_MAPS))),
                 };
                 std::future::ready(out)
             })
@@ -294,6 +422,79 @@ mod tests {
         lease.spec.as_mut().unwrap().lease_transitions = Some(-1);
         assert_eq!(from_lease(lease).transitions, 0);
         assert_eq!(from_lease(Lease::default()), LeaseRecord::default());
+    }
+
+    #[test]
+    fn scrub_hides_user_info() {
+        assert_eq!(
+            scrub("proxy socks5://user:pa55@proxy:1080/x failed"),
+            "proxy socks5://***@proxy:1080/x failed"
+        );
+        assert_eq!(
+            scrub("https://10.0.0.1:443/api"),
+            "https://10.0.0.1:443/api"
+        );
+        assert_eq!(scrub("a://b@c d://e"), "a://***@c d://e");
+        assert_eq!(scrub("no url"), "no url");
+        assert_eq!(scrub("end://u@h"), "end://***@h");
+    }
+
+    #[test]
+    fn infer_errors_split_no_cluster_from_bad_config() {
+        assert!(matches!(
+            classify_infer_error(false, "no config"),
+            KubeError::NoCluster(_)
+        ));
+        let bad = classify_infer_error(true, "bad yaml at https://u:p@h");
+        assert!(
+            matches!(bad, KubeError::Api(ref m) if m.contains("***@h") && !m.contains("u:p")),
+            "{bad}"
+        );
+    }
+
+    #[test]
+    fn mode_follows_kube_order() {
+        assert_eq!(mode_for(true), "kubeconfig");
+        assert_eq!(mode_for(false), "in_cluster");
+    }
+
+    #[test]
+    fn patch_has_only_elector_fields_and_the_version() {
+        let rec = LeaseRecord {
+            holder: None,
+            lease_duration_secs: 1,
+            acquire_time: Some(Timestamp::UNIX_EPOCH),
+            renew_time: None,
+            transitions: 2,
+            resource_version: Some("9".into()),
+        };
+        let p = lease_patch(&rec);
+        assert_eq!(p["metadata"], serde_json::json!({"resourceVersion": "9"}));
+        assert!(
+            p["spec"]["holderIdentity"].is_null(),
+            "null clears the holder"
+        );
+        assert!(p["spec"]["renewTime"].is_null());
+        assert_eq!(p["spec"]["acquireTime"], "1970-01-01T00:00:00.000000Z");
+        assert_eq!(p["spec"]["leaseTransitions"], 2);
+        assert_eq!(p["spec"].as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn watch_errors_map_forbidden() {
+        let status = kube::core::Status::failure("denied", "Forbidden").with_code(403);
+        let e = watcher::Error::InitialListFailed(kube::Error::Api(status.clone().boxed()));
+        assert!(
+            matches!(map_watch_error(&e, CONFIG_MAPS), KubeError::Forbidden { ref verb, .. } if verb == "list")
+        );
+        let e = watcher::Error::WatchError(status.boxed());
+        assert!(
+            matches!(map_watch_error(&e, CONFIG_MAPS), KubeError::Forbidden { ref verb, .. } if verb == "watch")
+        );
+        assert!(matches!(
+            map_watch_error(&watcher::Error::NoResourceVersion, CONFIG_MAPS),
+            KubeError::Api(_)
+        ));
     }
 
     #[test]

@@ -67,8 +67,10 @@ fn from_config_reads_autumn_and_kubernetes_sections() {
     assert!(s.events);
     assert_eq!(s.grace_period_secs(), 5 + 3 + 20 + 10);
 
+    assert!(s.api_access);
     kube.enabled = false;
     let off = ManifestSpec::from_config("shop", "img", &autumn, &kube);
+    assert!(!off.api_access, "plugin off: no token");
     assert_eq!(off.lease_name, None, "plugin off: no RBAC");
     assert!(off.config_maps.is_empty());
     assert!(!off.events);
@@ -124,30 +126,29 @@ fn role_has_only_needed_rules() {
             .collect::<Vec<_>>()
     };
     let leases = rule("coordination.k8s.io", "leases");
-    assert_eq!(leases.len(), 2);
-    assert!(
-        leases
-            .iter()
-            .any(|r| r.verbs == ["create"] && r.resource_names.is_none())
+    assert_eq!(leases.len(), 1, "one rule, limited by name");
+    assert_eq!(leases[0].verbs, ["create", "get", "patch", "update"]);
+    assert_eq!(
+        leases[0].resource_names.as_deref(),
+        Some(&["shop-leader".to_owned()][..])
     );
-    assert!(leases.iter().any(|r| r.verbs == ["get", "update"]
-        && r.resource_names.as_deref() == Some(&["shop-leader".to_owned()][..])));
     let cms = rule("", "configmaps");
     assert_eq!(cms.len(), 1);
-    assert_eq!(cms[0].verbs, ["get", "list", "watch"]);
+    assert_eq!(cms[0].verbs, ["list", "watch"], "the watch needs no get");
     assert_eq!(
         cms[0].resource_names.as_deref(),
         Some(&["flags".to_owned(), "limits".to_owned()][..])
     );
     let events = rule("events.k8s.io", "events");
     assert_eq!(events[0].verbs, ["create", "patch"]);
-    assert_eq!(rules.len(), 4);
+    assert_eq!(rules.len(), 3);
 }
 
 #[test]
-fn no_rbac_needed_gives_no_role_and_no_token() {
+fn no_api_access_gives_no_role_and_no_token() {
     let mut s = ManifestSpec::new("shop", "img");
     s.events = false;
+    s.api_access = false;
     s.replicas = 1;
     let objs = s.objects().unwrap();
     assert_eq!(
@@ -158,6 +159,24 @@ fn no_rbac_needed_gives_no_role_and_no_token() {
     assert_eq!(
         d["spec"]["template"]["spec"]["automountServiceAccountToken"],
         false
+    );
+}
+
+#[test]
+fn api_access_mounts_the_token_even_with_no_rules() {
+    let mut s = ManifestSpec::new("shop", "img");
+    s.events = false;
+    s.replicas = 1;
+    assert!(s.api_access, "default: the plugin talks to the API");
+    let objs = s.objects().unwrap();
+    assert_eq!(
+        kinds(&objs),
+        vec!["ServiceAccount", "Deployment", "Service"]
+    );
+    let d = find(&objs, "Deployment");
+    assert_eq!(
+        d["spec"]["template"]["spec"]["automountServiceAccountToken"],
+        true
     );
 }
 
