@@ -108,7 +108,8 @@ pub trait KubeApi: Send + Sync + 'static {
         name: &'a str,
     ) -> ApiFuture<'a, Option<LeaseRecord>>;
 
-    /// Creates a Lease. [`KubeError::Conflict`] when it exists.
+    /// Creates a Lease. [`KubeError::Conflict`] when it exists. It uses a PUT
+    /// (create on update), so RBAC can limit `create` by name.
     fn create_lease<'a>(
         &'a self,
         namespace: &'a str,
@@ -116,9 +117,10 @@ pub trait KubeApi: Send + Sync + 'static {
         record: &'a LeaseRecord,
     ) -> ApiFuture<'a, LeaseRecord>;
 
-    /// Replaces a Lease. [`KubeError::Conflict`] when
-    /// `record.resource_version` is old or missing. Like the API server, a
-    /// replace of a Lease that does not exist creates it.
+    /// Writes the elector fields of a Lease: holder, duration, times, and
+    /// transitions. Other fields and all metadata stay. The write needs
+    /// `record.resource_version` to match: else [`KubeError::Conflict`].
+    /// [`KubeError::NotFound`] when the Lease does not exist.
     fn replace_lease<'a>(
         &'a self,
         namespace: &'a str,
@@ -126,8 +128,9 @@ pub trait KubeApi: Send + Sync + 'static {
         record: &'a LeaseRecord,
     ) -> ApiFuture<'a, LeaseRecord>;
 
-    /// Watches one ConfigMap. The first item is the current state. The stream
-    /// retries on errors and yields them.
+    /// Watches one ConfigMap. The first item is the current state. After an
+    /// error, the stream tries again. It also sends each error as an item.
+    /// The stream does not end.
     fn watch_config_map(
         &self,
         namespace: &str,

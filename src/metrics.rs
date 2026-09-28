@@ -185,7 +185,7 @@ impl MetricsSource for KubernetesMetrics {
             let l = [("lease", lease)];
             out.push(family(
                 "kubernetes_leader",
-                "1 while this replica holds the lease",
+                "1 while this replica believes it leads",
                 MetricKind::Gauge,
                 vec![sample(&l, s.leading)],
             ));
@@ -222,7 +222,7 @@ impl MetricsSource for KubernetesMetrics {
         ));
         out.push(family(
             "kubernetes_api_up",
-            "1 when the last API server check passed, 0 when it failed",
+            "1 when the last API server check passed, 0 when it failed (checked every 5 s)",
             MetricKind::Gauge,
             u64::try_from(s.api_up)
                 .ok()

@@ -1,7 +1,8 @@
 //! Pure rules for leader election and grace periods. Verified core.
 //!
-//! `verus/policy.rs` holds the same code with specs and proofs. Keep both in
-//! step. The property tests below check this copy against the same specs.
+//! `verus/policy.rs` holds the same code with specs and proofs. When you
+//! change one file, make the same change in the other file. The property
+//! tests below check this copy against the same specs.
 //!
 //! Time is in milliseconds on the local monotonic clock.
 

@@ -36,10 +36,17 @@ Option 2.
 ## Results
 
 - Good: proven rules; faster failover on shutdown (`release_on_shutdown`).
-- Good: a dead elector (panic, abort) reads as "not leading".
+- Good: a dead elector (panic, abort) reads as "not leading". Belief has a
+  deadline (`LeaderState::valid_until`) that readers check on their own
+  clock, so a starved elector task cannot leave a stale "leading".
+- Good: leader tasks stop before the takeover gap (`lease - renew`) ends.
+  The supervisor aborts a task that does not stop in time.
+- Good: a record `leaseDurationSeconds` is capped at one hour. A foreign
+  writer cannot hold the lease for years.
 - Bad: `#[scheduled]` tasks do not use the Lease. Use `LeaderTask`.
-- Bad: the proof assumes equal clock rates. A paused VM can outlive its
-  belief. Leader tasks must be safe to run twice when this matters.
+- Bad: the proof assumes equal clock rates. A VM that pauses can continue
+  leader work after its belief window stops. If this matters, make leader
+  tasks safe to run twice.
 
 ## Upstream seam (proposed)
 

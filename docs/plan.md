@@ -86,6 +86,22 @@ Found during implementation:
 | Detached replicas outside Kubernetes all run the singleton. | Leader tasks run detached only with `lead_when_detached`. |
 | Huge `retry_period` overflows the timing check (Verus found it). | Reject `retry >= renew` first. |
 
+Found in review round 1 (five reviewers):
+
+| How to fail | Counter-measure |
+|---|---|
+| The task supervisor spins after the elector dies while leading. | Stop when the channel closes. |
+| A starved elector task leaves a stale "leading". | Belief deadline, checked on the reader's clock. |
+| Old-term tasks overlap the new leader's tasks. | Stop timeout below `lease - renew`; await aborts. |
+| A foreign writer sets `leaseDurationSeconds` to 68 years. | Cap the record duration at one hour (Verus). |
+| A renew PUT removes labels and owner references. | JSON merge patch with a `resourceVersion` check. |
+| `create` on any Lease name lets a pod squat another app's lease. | Create with PUT; `create` limited by name. |
+| A Docker image ignores `[kubernetes]` (build path baked in). | Per-file fallback to the working directory. |
+| autumn drops the shutdown hook before the lease is released. | The hook spawns its work. |
+| Logs show exec-plugin output or proxy passwords. | Scrub URL user info; replace auth and proxy errors. |
+| A bad kubeconfig silently runs detached. | Error when a config is present. |
+| Each health request hits the API server. | Reuse results; refresh in the background. |
+
 ## 6. Six thinking hats
 
 - **White (facts):** Lease fields: `holderIdentity`, `leaseDurationSeconds`, `acquireTime`, `renewTime`, `leaseTransitions`. client-go uses the observed time, not `renewTime`, for expiry. Update needs a matching `resourceVersion`. Events use `events.k8s.io/v1`. Autumn default shutdown timeout is 30 s.
@@ -106,7 +122,7 @@ flowchart LR
     P --> H[Health + metrics]
     E -->|leading| T[Leader tasks]
   end
-  E -->|get / create / replace Lease| API[(Kubernetes API)]
+  E -->|get / create / patch Lease| API[(Kubernetes API)]
   W -->|watch ConfigMaps| API
   P -->|Events| API
   H -->|GET /version| API
@@ -117,14 +133,12 @@ stateDiagram-v2
   [*] --> Follower
   Follower --> Leader: create or take over (lease free or expired)
   Leader --> Leader: renew OK
-  Leader --> Follower: renew deadline passed, or other holder seen
-  Leader --> Released: shutdown
+  Leader --> Follower: renew deadline passed, conflict, or other holder seen
+  Leader --> Released: shutdown, with release_on_shutdown
   Released --> [*]
 ```
 
 Modules:
-
-ADRs: `docs/adr/0001` to `0004`.
 
 - `policy` — pure rules. Verified core.
 - `api` — `KubeApi` trait, `KubeClientApi` (real), `MemoryKubeApi` (fake).
@@ -135,6 +149,8 @@ ADRs: `docs/adr/0001` to `0004`.
 - `health`, `metrics` — actuator parts.
 - `manifest` — YAML generator.
 - `plugin` — `KubernetesPlugin` and `KubernetesRuntime`.
+
+ADRs: `docs/adr/0001` to `0004`.
 
 ## 8. Acceptance criteria
 

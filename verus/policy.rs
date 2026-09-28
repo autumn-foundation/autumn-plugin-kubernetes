@@ -1,6 +1,6 @@
 //! Verus spec and proof for `src/policy.rs`.
 //!
-//! Keep this file in step with `src/policy.rs`.
+//! When you change this file, make the same change in `src/policy.rs`.
 //! Run: `verus verus/policy.rs`.
 //!
 //! Time is in milliseconds on one local monotonic clock per process.

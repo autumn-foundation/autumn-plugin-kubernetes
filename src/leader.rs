@@ -3,8 +3,11 @@
 //! The rules are in [`crate::policy`] (verified with Verus):
 //! - Expiry uses the local time when the record last changed. Remote clocks
 //!   have no effect.
-//! - Belief ends `renew_deadline` after the last good write was sent, or at
-//!   once when another holder or a write conflict is seen.
+//! - Belief stops `renew_deadline` after the elector sends its last
+//!   successful write. Belief also stops immediately when the elector sees
+//!   another holder or a write conflict.
+//! - Readers check the belief deadline on their own clock. A starved elector
+//!   cannot leave a stale "leading".
 //! - Writes use `resourceVersion`. A conflict loses the race.
 
 use std::future::Future;
@@ -572,8 +575,9 @@ impl ElectorHandle {
         self.leadership.clone()
     }
 
-    /// Stops the loop. Belief ends first. Then, with `release_on_shutdown`,
-    /// the lease is cleared so another replica takes over at once.
+    /// Stops the loop. Belief stops first. If `release_on_shutdown` is true,
+    /// the elector then clears the holder. Another replica can then take the
+    /// lease immediately.
     pub async fn stop(mut self) {
         self.cancel.cancel();
         if let Some(task) = self.task.take()
@@ -583,8 +587,8 @@ impl ElectorHandle {
         }
     }
 
-    /// Stops the loop like a crash: no release. For failover tests. This
-    /// handle then shows "not leading", as a dead process believes nothing.
+    /// Stops the loop like a crash: no release. For failover tests. After
+    /// this call, `is_leader` returns `false`.
     pub fn abort(mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -596,10 +600,12 @@ type TaskFn = Arc<dyn Fn(AppState, CancellationToken) -> BoxFuture<'static, ()> 
 
 /// Work that runs only on the leader.
 ///
-/// The task starts when this replica becomes leader. The token is cancelled
-/// when leadership ends or the app stops. The task must then return soon.
-/// One run per term. A task that returns early does not run again until the
-/// next term.
+/// The task starts when this replica becomes leader. The supervisor cancels
+/// the token when leadership stops or the app stops. The task must then
+/// return before the stop timeout: `lease_duration - renew_deadline` less 20%
+/// (4 s with the defaults), at most 10 s. After that time, the supervisor
+/// aborts the task. The task runs one time in each term. If it returns early,
+/// it runs again only in the next term.
 #[derive(Clone)]
 pub struct LeaderTask {
     name: String,
@@ -648,8 +654,9 @@ impl Drop for LeaderTasks {
 }
 
 impl LeaderTasks {
-    /// Starts the supervisor. `stop_timeout` limits the wait for tasks to
-    /// return after their token is cancelled. Then they are aborted.
+    /// Starts the supervisor. `stop_timeout` is the time that tasks get to
+    /// return after the supervisor cancels their token. After this time, the
+    /// supervisor aborts the tasks.
     #[must_use]
     pub fn start(
         leadership: Leadership,

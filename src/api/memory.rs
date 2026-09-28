@@ -32,8 +32,10 @@ struct State {
 
 /// In-memory fake of the Kubernetes API. Clones share state.
 ///
-/// It follows the API server rules: create fails when the Lease exists, and
-/// replace needs the current `resourceVersion`.
+/// It follows the API server rules that `tests/common/contract.rs` checks:
+/// create fails when the Lease exists, and replace needs the current
+/// `resourceVersion`. It does not model metadata, microsecond time, or no-op
+/// updates.
 #[derive(Clone, Default)]
 pub struct MemoryKubeApi {
     state: Arc<Mutex<State>>,

@@ -49,8 +49,8 @@ impl KubeClientApi {
     /// `~/.kube/config`).
     ///
     /// # Errors
-    /// Returns [`KubeError::NoCluster`] when neither is found, and
-    /// [`KubeError::Api`] when the config is bad.
+    /// Returns [`KubeError::NoCluster`] when there is no kubeconfig and no
+    /// pod. Returns [`KubeError::Api`] when a config is present but bad.
     pub async fn connect(instance: Option<String>) -> Result<Self, KubeError> {
         let config = kube::Config::infer()
             .await

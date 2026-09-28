@@ -54,7 +54,9 @@ pub struct LeaderElectionConfig {
     pub enabled: bool,
     /// Lease name. Necessary when enabled.
     pub lease_name: String,
-    /// Holder identity. Empty: pod name (or host name) plus a random suffix.
+    /// Holder identity. Empty: `<name>-<8 random hex digits>`, where `<name>`
+    /// is `POD_NAME`, else `HOSTNAME`, else `autumn`. Each process needs its
+    /// own identity. Do not give one fixed value to many replicas.
     pub identity: String,
     /// Lease duration. Other replicas take over after this time.
     pub lease_duration_secs: u64,

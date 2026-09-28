@@ -7,6 +7,8 @@
 
 - Build objects with `k8s-openapi` types. Output JSON values and YAML.
 - YAML with `serde-saphyr`. `kube-client` uses it already. No new YAML crate.
+  It is a 0.0.x crate: keep its version the same as the one that
+  `kube-client` uses.
 - The library sets no k8s-openapi version feature (k8s-openapi rule). The
   app picks one, or turns on this crate's `latest` feature. CI checks the
   library on 1.32 to 1.36.
@@ -18,10 +20,17 @@
   no shell.
 - Grace period: `preStop + prestop_grace + shutdown_timeout + buffer`
   (Autumn cloud-native guide). Saturating. Proven in Verus.
-- RBAC: Lease `create` (cannot use names) plus `get`/`update` on the lease
-  name. ConfigMaps `get`/`list`/`watch` with `resourceNames` (the watch uses a
-  `metadata.name` field selector). Events `create`/`patch` in
-  `events.k8s.io`. No Role when nothing is needed, and no token mount.
+- RBAC: one Lease rule, `create`/`get`/`patch`/`update`, limited to the
+  lease name. The elector creates with a PUT (create on update), so RBAC can
+  limit `create` by name. A POST create cannot have a name limit. Renew and
+  release use a JSON merge patch with a `resourceVersion` check, so labels,
+  annotations, and owner references that other tools set stay.
+- ConfigMaps: `list`/`watch` with `resourceNames`. The watch uses a
+  `metadata.name` field selector, so the names apply.
+- Events: `create`/`patch` in `events.k8s.io`.
+- When the config needs no API access, the generator makes no Role. The
+  token mounts when the plugin is enabled (`api_access`), because in-cluster
+  config needs it.
 - PDB only with 2 or more replicas. With 1, it blocks node drains.
 - Container security: no privilege escalation, non-root, drop all
   capabilities, `RuntimeDefault` seccomp.

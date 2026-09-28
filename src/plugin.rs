@@ -127,7 +127,8 @@ impl KubernetesPlugin {
         self
     }
 
-    /// Puts the health indicator in `/ready` too. Default: `/health` only.
+    /// Puts the health indicator in `/ready` too. Default: `/actuator/health`
+    /// only.
     ///
     /// autumn reads this when the app builds, before the config loads. So it
     /// is a builder setting, not a config key.

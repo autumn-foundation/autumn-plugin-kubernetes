@@ -86,6 +86,8 @@ impl PodInfo {
 }
 
 /// Parses a Downward API `labels` or `annotations` file: `key="value"` lines.
+/// Values are Go-quoted. JSON reads the common escapes. A value with a Go-only
+/// escape (`\a`, `\v`, `\x..`) is kept as raw text.
 #[must_use]
 pub fn parse_downward_file(text: &str) -> BTreeMap<String, String> {
     text.lines()

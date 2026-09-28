@@ -16,6 +16,10 @@
 ## Reasons
 
 - Local development must work with no cluster.
-- If detached replicas led by default, a deploy outside Kubernetes (ECS,
-  Nomad) would run a singleton on every replica, with no warning.
+- Detached replicas do not lead by default. If they did, each replica of a
+  deployment outside Kubernetes (ECS, Nomad) would run the singleton task.
 - A control plane outage must not remove every pod from its Service.
+- The API check result is reused (5 s up, 1 s down) and refreshed in the
+  background. Health requests from outside do not load the API server.
+- A kubeconfig that exists but does not load is an error, not detached
+  mode. Detached mode needs no kubeconfig and no pod.
