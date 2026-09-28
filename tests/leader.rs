@@ -616,3 +616,34 @@ fn is_leader_ends_at_deadline_even_if_the_elector_is_starved() {
     );
     worker.join().unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn release_failure_is_counted_and_stop_still_ends() {
+    let api = MemoryKubeApi::new();
+    let metrics = Arc::new(KubernetesMetrics::new());
+    let a = LeaderElector::new(Arc::new(api.clone()), NS, "a", leader_config())
+        .unwrap()
+        .with_metrics(Arc::clone(&metrics))
+        .start();
+    assert!(a.leadership().wait_until_leader().await);
+    let before = metrics.snapshot().lease_errors;
+    api.set_down(true);
+    a.stop().await;
+    assert!(
+        metrics.snapshot().lease_errors > before,
+        "release error counted"
+    );
+    assert!(api.lease(NS, LEASE).unwrap().held_by("a"), "not released");
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_skips_a_lease_that_another_replica_holds() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    assert!(a.leadership().wait_until_leader().await);
+    let mut other = api.lease(NS, LEASE).unwrap();
+    other.holder = Some("b".into());
+    api.put_lease(NS, LEASE, other);
+    a.stop().await;
+    assert!(api.lease(NS, LEASE).unwrap().held_by("b"), "b keeps it");
+}

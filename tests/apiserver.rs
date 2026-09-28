@@ -400,6 +400,7 @@ async fn generated_rbac_is_enough_and_minimal() {
 async fn plugin_health_on_real_server() {
     let Some(dir) = it_dir() else { return };
     let admin_dir = dir.clone();
+    let state = AppState::for_test();
     let rt = KubernetesPlugin::with_config(KubernetesConfig {
         required: true,
         ..KubernetesConfig::default()
@@ -409,9 +410,13 @@ async fn plugin_health_on_real_server() {
         let dir = admin_dir.clone();
         async move { Ok(client(&dir, "admin.kubeconfig").await) }
     })
-    .start(&AppState::for_test())
+    .start(&state)
     .await
     .unwrap();
+    assert!(
+        state.extension::<kube::Client>().is_some(),
+        "the app gets the kube::Client"
+    );
     let out = rt.health().check().await;
     assert_eq!(out.status, HealthStatus::Up);
     assert_eq!(out.details["mode"], "custom");
@@ -461,4 +466,60 @@ async fn replace_keeps_metadata_and_other_spec_fields() {
         "x"
     );
     assert_eq!(after.spec.unwrap().holder_identity.as_deref(), Some("b"));
+}
+
+/// The default connect path (kubeconfig) end to end: run `examples/app` with
+/// `KUBECONFIG` and read its health (AC3).
+#[tokio::test]
+async fn example_app_connects_with_kubeconfig() {
+    use std::io::{Read, Write};
+    let Some(dir) = it_dir() else { return };
+    let exe = std::env::current_exe().unwrap();
+    let app = exe.parent().unwrap().parent().unwrap().join("examples/app");
+    assert!(app.exists(), "build the examples first");
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let work = std::env::temp_dir().join(format!("akp-app-{}", std::process::id()));
+    std::fs::create_dir_all(&work).unwrap();
+    // No HTTPS_PROXY in the child env: the test server is on 127.0.0.1.
+    let mut child = std::process::Command::new(app)
+        .current_dir(&work)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &work)
+        .env("KUBECONFIG", dir.join("admin.kubeconfig"))
+        .env("AUTUMN_MANIFEST_DIR", &work)
+        .env("AUTUMN_SERVER__PORT", port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let get = |path: &str| -> Option<String> {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .ok()?;
+        let mut body = String::new();
+        s.read_to_string(&mut body).ok()?;
+        Some(body)
+    };
+    let mut health = String::new();
+    for _ in 0..150 {
+        if let Some(b) = get("/actuator/health")
+            && b.contains("\"leading\":true")
+        {
+            health = b;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&work);
+    assert!(health.contains("\"mode\":\"kubeconfig\""), "{health}");
+    assert!(health.contains("\"lease\":\"example-leader\""), "{health}");
 }

@@ -502,3 +502,19 @@ async fn losing_the_lease_writes_leader_lost() {
     assert_eq!(lost.kind, autumn_plugin_kubernetes::api::EventKind::Warning);
     rt.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn required_with_a_silent_api_times_out() {
+    let api = MemoryKubeApi::new();
+    api.set_latency(Duration::from_secs(60));
+    let mut cfg = config();
+    cfg.required = true;
+    let err = plugin(&api, cfg)
+        .start(&AppState::for_test())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, KubeError::Api(ref m) if m.contains("in time")),
+        "{err}"
+    );
+}
