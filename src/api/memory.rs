@@ -234,8 +234,10 @@ impl MemoryKubeApi {
         Self::write_guard(&mut s, "update")?;
         let k = key(namespace, name);
         let result = match s.leases.get(&k) {
-            None => Err(KubeError::NotFound(format!(
-                "leases.coordination.k8s.io \"{name}\" not found"
+            // Like the API server: Leases allow create on update.
+            None if record.resource_version.is_some() => Ok(Self::store(&mut s, k, record)),
+            None => Err(KubeError::Conflict(format!(
+                "leases.coordination.k8s.io \"{name}\": no resourceVersion"
             ))),
             Some(current)
                 if record.resource_version.is_none()
@@ -399,10 +401,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_missing_is_not_found() {
+    async fn replace_missing_creates_like_the_api_server() {
         let api = MemoryKubeApi::new();
         let err = api.replace_lease("ns", "l", &rec("a")).await.unwrap_err();
-        assert!(matches!(err, KubeError::NotFound(_)), "{err}");
+        assert!(matches!(err, KubeError::Conflict(_)), "no version: {err}");
+        let mut with_version = rec("a");
+        with_version.resource_version = Some("9".into());
+        let made = api.replace_lease("ns", "l", &with_version).await.unwrap();
+        assert!(made.held_by("a"));
     }
 
     #[tokio::test]

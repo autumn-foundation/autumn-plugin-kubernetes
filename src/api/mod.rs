@@ -116,8 +116,8 @@ pub trait KubeApi: Send + Sync + 'static {
     ) -> ApiFuture<'a, LeaseRecord>;
 
     /// Replaces a Lease. [`KubeError::Conflict`] when
-    /// `record.resource_version` is old. [`KubeError::NotFound`] when it
-    /// does not exist.
+    /// `record.resource_version` is old or missing. Like the API server, a
+    /// replace of a Lease that does not exist creates it.
     fn replace_lease<'a>(
         &'a self,
         namespace: &'a str,

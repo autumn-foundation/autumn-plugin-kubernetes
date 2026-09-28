@@ -1,6 +1,8 @@
 //! Shared test helpers.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+pub mod contract;
+
 use std::sync::Arc;
 use std::time::Duration;
 
