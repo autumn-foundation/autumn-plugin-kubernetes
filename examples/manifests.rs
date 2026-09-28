@@ -1,6 +1,6 @@
 //! Prints Kubernetes YAML for an Autumn app.
 //!
-//! `cargo run --example manifests -- <name> <image> [namespace]`
+//! `cargo run --example manifests -- <name> <image> [namespace] --profile prod`
 //!
 //! It loads the app config like autumn-web: `autumn.toml`, the profile
 //! (`AUTUMN_ENV`, `AUTUMN_PROFILE`, or `--profile`), `autumn-<profile>.toml`,
@@ -24,9 +24,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let (Some(name), Some(image)) = (args.first(), args.get(1)) else {
-        eprintln!("usage: manifests <name> <image> [namespace] [--profile <name>]");
+        eprintln!("usage: manifests <name> <image> [namespace] --profile <name>");
         std::process::exit(2);
     };
+    // With no profile, autumn uses dev (1 s shutdown timeout). That gives a
+    // grace period far too short for the pods. Ask for the pod profile.
+    let profile_set = ["AUTUMN_ENV", "AUTUMN_PROFILE"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+        || std::env::args().any(|a| a == "--profile" || a.starts_with("--profile="));
+    if !profile_set {
+        eprintln!(
+            "manifests: choose the profile that the pods run with: --profile prod \
+             (or AUTUMN_ENV). The Deployment sets AUTUMN_ENV to it."
+        );
+        std::process::exit(2);
+    }
     let autumn = AutumnConfig::load_lenient_unknown_roots()?;
     let kube = KubernetesConfig::load(autumn.profile_name())?;
     let mut spec = ManifestSpec::from_config(name.as_str(), image.as_str(), &autumn, &kube);

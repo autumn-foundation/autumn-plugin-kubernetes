@@ -5,9 +5,18 @@
 //!
 //! The config is in code, so the example runs with no `autumn.toml`. With no
 //! cluster, the plugin runs detached and, for this demo, acts as leader
-//! (`lead_when_detached`). In a cluster, apply the output of
-//! `cargo run --example manifests -- example <image>`. A real app uses
-//! `KubernetesPlugin::new()` and the `[kubernetes]` section instead.
+//! (`lead_when_detached`). A real app uses `KubernetesPlugin::new()` and the
+//! `[kubernetes]` section instead.
+//!
+//! For a cluster, give the manifest tool the same config, so the Role has
+//! the lease and ConfigMap rules:
+//!
+//! ```bash
+//! AUTUMN_KUBERNETES__LEADER_ELECTION__ENABLED=true \
+//! AUTUMN_KUBERNETES__LEADER_ELECTION__LEASE_NAME=example-leader \
+//! AUTUMN_KUBERNETES__CONFIG_MAPS__WATCH=example-flags \
+//! cargo run --example manifests -- example <image> --profile prod
+//! ```
 
 use std::time::Duration;
 

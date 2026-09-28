@@ -25,6 +25,7 @@ fn find<'a>(objs: &'a [Value], kind: &str) -> &'a Value {
 
 fn full_spec() -> ManifestSpec {
     let mut s = ManifestSpec::new("shop", "ghcr.io/acme/shop:1.2.3");
+    s.profile = Some("prod".into());
     s.namespace = "prod".into();
     s.lease_name = Some("shop-leader".into());
     s.config_maps = vec!["flags".into(), "limits".into()];
@@ -66,6 +67,7 @@ fn from_config_reads_autumn_and_kubernetes_sections() {
     assert_eq!(s.config_maps, vec!["flags".to_owned()]);
     assert!(s.events);
     assert_eq!(s.grace_period_secs(), 5 + 3 + 20 + 10);
+    assert_eq!(s.profile, None, "no profile in a default AutumnConfig");
 
     assert!(s.api_access);
     kube.enabled = false;
@@ -240,6 +242,11 @@ fn deployment_wires_probes_env_prestop_and_grace() {
     );
     assert_eq!(env["AUTUMN_SERVER__PORT"].value.as_deref(), Some("3000"));
     assert_eq!(env["AUTUMN_ROLE"].value.as_deref(), Some("web"));
+    assert_eq!(
+        env["AUTUMN_ENV"].value.as_deref(),
+        Some("prod"),
+        "pods run the profile that made the manifests"
+    );
     assert_eq!(env["RUST_LOG"].value.as_deref(), Some("info"));
     let mount = &c.volume_mounts.as_ref().unwrap()[0];
     assert_eq!(mount.mount_path, "/etc/podinfo");

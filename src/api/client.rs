@@ -64,14 +64,10 @@ impl KubeClientApi {
     }
 }
 
-/// `true` when this process has a kubeconfig or runs in a pod. Then a config
-/// error is a real error, not "no cluster".
+/// `true` when a kubeconfig file exists or this process runs in a pod. Then
+/// a config error is a real error, not "no cluster".
 fn cluster_config_present() -> bool {
-    let kubeconfig_env = std::env::var_os("KUBECONFIG").is_some_and(|v| !v.is_empty());
-    let home_config = std::env::var_os("HOME")
-        .is_some_and(|h| std::path::Path::new(&h).join(".kube/config").exists());
-    let in_pod = std::env::var_os("KUBERNETES_SERVICE_HOST").is_some();
-    kubeconfig_env || home_config || in_pod
+    kubeconfig_present() || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
 }
 
 /// Config inference failed. With no kubeconfig and no pod, there is no
@@ -96,11 +92,23 @@ pub(crate) const fn mode_for(kubeconfig_present: bool) -> &'static str {
     }
 }
 
-/// `true` when kube will use a kubeconfig file.
+/// `true` when a kubeconfig file exists: a path in `KUBECONFIG` (a list), or
+/// `~/.kube/config` when `KUBECONFIG` is not set. kube reads it first.
 pub(crate) fn kubeconfig_present() -> bool {
-    std::env::var_os("KUBECONFIG").is_some_and(|v| !v.is_empty())
-        || std::env::var_os("HOME")
-            .is_some_and(|h| std::path::Path::new(&h).join(".kube/config").exists())
+    kubeconfig_file_exists(
+        std::env::var_os("KUBECONFIG").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+pub(crate) fn kubeconfig_file_exists(
+    kubeconfig: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> bool {
+    kubeconfig.filter(|v| !v.is_empty()).map_or_else(
+        || home.is_some_and(|h| std::path::Path::new(h).join(".kube/config").is_file()),
+        |list| std::env::split_paths(list).any(|p| p.is_file()),
+    )
 }
 
 /// Removes URL user info (`scheme://user:pass@host` to `scheme://***@host`).
@@ -450,6 +458,36 @@ mod tests {
             matches!(bad, KubeError::Api(ref m) if m.contains("***@h") && !m.contains("u:p")),
             "{bad}"
         );
+    }
+
+    #[test]
+    fn kubeconfig_presence_needs_a_file() {
+        use std::ffi::OsStr;
+        let dir = std::env::temp_dir().join(format!("akp-kc-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".kube")).unwrap();
+        let file = dir.join("kc");
+        std::fs::write(&file, "").unwrap();
+        let list = std::env::join_paths([dir.join("missing"), file]).unwrap();
+        assert!(
+            kubeconfig_file_exists(Some(&list), None),
+            "any path in the list"
+        );
+        assert!(!kubeconfig_file_exists(
+            Some(OsStr::new("/no/such")),
+            Some(dir.as_os_str())
+        ));
+        assert!(
+            !kubeconfig_file_exists(None, Some(dir.as_os_str())),
+            "no ~/.kube/config"
+        );
+        std::fs::write(dir.join(".kube/config"), "").unwrap();
+        assert!(kubeconfig_file_exists(None, Some(dir.as_os_str())));
+        assert!(
+            kubeconfig_file_exists(Some(OsStr::new("")), Some(dir.as_os_str())),
+            "empty: home"
+        );
+        assert!(!kubeconfig_file_exists(None, None));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

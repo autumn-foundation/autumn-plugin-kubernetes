@@ -75,6 +75,8 @@ Leader election rules (proven in `verus/policy.rs`):
 3. `renew_deadline < lease_duration`. So, with equal clock rates, two replicas never both believe they lead.
 4. Writes use `resourceVersion`. A conflict loses the race and ends belief immediately.
 
+Call `KubernetesRuntime::shutdown` (the plugin does it at app shutdown) to release the lease after the leader tasks stop. A drop with no shutdown does not release: the lease then expires after `lease_duration`.
+
 `Leadership::is_leader` reads the belief deadline on the caller's clock. So a blocked elector task cannot leave a stale "leading".
 A VM that pauses, or a large clock-rate drift, can break rule 3. If this matters, make a leader task safe to run twice.
 
@@ -166,11 +168,11 @@ The API check result is reused: 5 s when up, 1 s when down.
 ## Manifests
 
 ```bash
-cargo run --example manifests -- shop ghcr.io/acme/shop:1.0.0 prod > k8s.yaml
+cargo run --example manifests -- shop ghcr.io/acme/shop:1.0.0 shop-ns --profile prod > k8s.yaml
 kubectl apply -f k8s.yaml
 ```
 
-The example loads your real Autumn config and profile. In code: `ManifestSpec::from_config(name, image, &autumn_config, &kube_config).render_yaml()`.
+The example loads your real Autumn config. It needs the pod profile (`--profile` or `AUTUMN_ENV`): without one, autumn uses dev, with a 1 s shutdown timeout. The Deployment sets `AUTUMN_ENV` to that profile. In code: `ManifestSpec::from_config(name, image, &autumn_config, &kube_config).render_yaml()`.
 
 - The probes come from `health.live_path`, `ready_path`, and `startup_path`. Readiness fails on the first 503.
 - `terminationGracePeriodSeconds = preStop + prestop_grace + shutdown_timeout + buffer` (Autumn formula).

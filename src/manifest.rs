@@ -64,6 +64,9 @@ pub struct ManifestSpec {
     pub replicas: i32,
     /// Process role. `None`: `combined` (no `AUTUMN_ROLE` env).
     pub role: Option<ProcessRole>,
+    /// Autumn profile for the pods (`AUTUMN_ENV`). Use the profile that made
+    /// this spec, so the grace period matches the shutdown timeout.
+    pub profile: Option<String>,
     /// Probe paths.
     pub probes: ProbePaths,
     /// `preStop` sleep in seconds. 0: no hook.
@@ -112,6 +115,7 @@ impl ManifestSpec {
             port: 3000,
             replicas: 2,
             role: None,
+            profile: None,
             probes: ProbePaths::default(),
             prestop_hook_secs: 5,
             prestop_grace_secs: 5,
@@ -143,6 +147,7 @@ impl ManifestSpec {
             startup: autumn.health.startup_path.clone(),
         };
         s.role = (autumn.role != ProcessRole::Combined).then_some(autumn.role);
+        s.profile = autumn.profile_name().map(str::to_owned);
         if !kube.namespace.is_empty() {
             s.namespace.clone_from(&kube.namespace);
         }
@@ -399,6 +404,9 @@ impl ManifestSpec {
         ]);
         if let Some(role) = self.role {
             plain.insert("AUTUMN_ROLE".to_owned(), role.as_str().to_owned());
+        }
+        if let Some(profile) = &self.profile {
+            plain.insert("AUTUMN_ENV".to_owned(), profile.clone());
         }
         plain.extend(self.env.clone());
         env.extend(plain.into_iter().map(|(name, value)| EnvVar {

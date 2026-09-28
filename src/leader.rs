@@ -248,7 +248,9 @@ impl LeaderElector {
             rx,
         };
         let cancel = CancellationToken::new();
+        let no_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let run = Loop {
+            no_release: Arc::clone(&no_release),
             base: Instant::now(),
             wall_base: Timestamp::now(),
             observed: None,
@@ -264,6 +266,7 @@ impl LeaderElector {
         ElectorHandle {
             leadership,
             cancel,
+            no_release,
             task: Some(task),
         }
     }
@@ -283,6 +286,9 @@ pub(crate) fn random_u64() -> u64 {
 /// The state of one election loop.
 struct Loop {
     elector: LeaderElector,
+    /// Set by a drop or an abort: stop with no release write. Leader tasks
+    /// may still run then, so the lease must expire, not be freed.
+    no_release: Arc<std::sync::atomic::AtomicBool>,
     tx: watch::Sender<LeaderState>,
     /// Start of the local monotonic time line.
     base: Instant,
@@ -511,7 +517,8 @@ impl Loop {
         self.holder_is_me = false;
         self.sent_ok = None;
         self.publish(true);
-        if self.cfg().release_on_shutdown && self.ever_won {
+        let released_ok = !self.no_release.load(std::sync::atomic::Ordering::SeqCst);
+        if self.cfg().release_on_shutdown && self.ever_won && released_ok {
             let release = tokio::time::timeout(call_timeout, self.release()).await;
             match release {
                 Ok(Ok(())) => {}
@@ -553,17 +560,25 @@ async fn sleep_until_opt(at: Option<Instant>) {
     }
 }
 
-/// A running elector. A drop stops it like [`ElectorHandle::stop`], in the
-/// background.
+/// A running elector.
+///
+/// A drop stops it in the background with no release: leader tasks can
+/// still run, so the lease expires after `lease_duration`. Call
+/// [`ElectorHandle::stop`] (after the tasks stop) to release it.
 #[derive(Debug)]
 pub struct ElectorHandle {
     leadership: Leadership,
     cancel: CancellationToken,
+    no_release: Arc<std::sync::atomic::AtomicBool>,
     task: Option<JoinHandle<()>>,
 }
 
 impl Drop for ElectorHandle {
     fn drop(&mut self) {
+        if self.task.is_some() {
+            self.no_release
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.cancel.cancel();
     }
 }
@@ -588,8 +603,10 @@ impl ElectorHandle {
     }
 
     /// Stops the loop like a crash: no release. For failover tests. After
-    /// this call, `is_leader` returns `false`.
+    /// the runtime next runs the aborted task, `is_leader` returns `false`.
     pub fn abort(mut self) {
+        self.no_release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(task) = self.task.take() {
             task.abort();
         }

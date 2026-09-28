@@ -79,6 +79,10 @@ events = false
     );
     // 5 (preStop) + 5 (prestop grace) + 60 (shutdown) + 10 (buffer).
     assert!(yaml.contains("terminationGracePeriodSeconds: 80"), "{yaml}");
+    assert!(
+        yaml.contains("name: AUTUMN_ENV\n          value: prod"),
+        "{yaml}"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -113,6 +117,24 @@ fn dotenv_applies_in_dev_like_autumn() {
     );
     assert!(yaml.contains("- flags"), ".env applies in dev:\n{yaml}");
     assert!(yaml.contains("namespace: from-env"), "env wins:\n{yaml}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Review round 2: with no profile, autumn falls back to dev (1 s shutdown),
+/// which gives a far too short grace period. The example asks for one.
+#[test]
+fn manifests_need_an_explicit_profile() {
+    let dir = temp_dir("noprofile");
+    let out = Command::new(example("manifests"))
+        .args(["shop", "img"])
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("AUTUMN_MANIFEST_DIR", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("profile"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

@@ -537,6 +537,12 @@ async fn dropped_elector_handle_stops_renewing() {
     let writes = api.lease_writes();
     advance(S(10)).await;
     assert_eq!(api.lease_writes(), writes, "no renews after drop");
+    // A drop does not release: leader tasks may still run. The lease
+    // expires after lease_duration, which is longer than the stop timeout.
+    assert!(
+        api.lease(NS, LEASE).unwrap().held_by("a"),
+        "not released on drop"
+    );
 }
 
 #[tokio::test(start_paused = true)]

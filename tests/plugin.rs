@@ -503,6 +503,69 @@ async fn losing_the_lease_writes_leader_lost() {
     rt.shutdown().await;
 }
 
+/// Review round 2: a dropped runtime must not free the lease while its
+/// leader tasks still clean up.
+#[tokio::test(start_paused = true)]
+async fn dropped_runtime_does_not_overlap_leader_tasks() {
+    let api = MemoryKubeApi::new();
+    let running = Arc::new(AtomicU32::new(0));
+    let max_seen = Arc::new(AtomicU32::new(0));
+    let task = |running: &Arc<AtomicU32>, max_seen: &Arc<AtomicU32>| {
+        let (running, max_seen) = (Arc::clone(running), Arc::clone(max_seen));
+        LeaderTask::new("slow-cleanup", move |_s: AppState, cancel| {
+            let (running, max_seen) = (Arc::clone(&running), Arc::clone(&max_seen));
+            async move {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                cancel.cancelled().await;
+                // Cleanup that takes 3 s (under the 4 s stop timeout).
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+            }
+        })
+    };
+    let pod_a = PodInfo {
+        name: Some("a".into()),
+        ..pod()
+    };
+    let pod_b = PodInfo {
+        name: Some("b".into()),
+        ..pod()
+    };
+    let a = KubernetesPlugin::with_config(config())
+        .with_api(api.clone())
+        .with_pod_info(pod_a)
+        .leader_task(task(&running, &max_seen))
+        .start(&AppState::for_test())
+        .await
+        .unwrap();
+    assert!(a.leadership().unwrap().wait_until_leader().await);
+    let b = KubernetesPlugin::with_config(config())
+        .with_api(api.clone())
+        .with_pod_info(pod_b)
+        .leader_task(task(&running, &max_seen))
+        .start(&AppState::for_test())
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(5), || {
+        running.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    drop(a);
+    let lb = b.leadership().unwrap();
+    wait_until(Duration::from_secs(30), || lb.is_leader()).await;
+    wait_until(Duration::from_secs(5), || {
+        running.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "two leader tasks ran at once"
+    );
+    b.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn required_with_a_silent_api_times_out() {
     let api = MemoryKubeApi::new();

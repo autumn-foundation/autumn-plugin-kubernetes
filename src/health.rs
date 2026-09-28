@@ -72,12 +72,11 @@ impl KubernetesHealth {
         }
     }
 
-    /// Checks the API server now and stores the result. The runtime calls it
-    /// in the background.
+    /// Checks the API server when the stored result is old. The runtime
+    /// calls it in the background. A fresh result is not checked again, so a
+    /// request waits for at most one probe.
     pub(crate) async fn refresh(&self) {
-        let mut cache = self.cache.lock().await;
-        let result = self.probe().await;
-        *cache = Some((Instant::now(), result));
+        let _ = self.api_status().await;
     }
 
     /// One `GET /version`. Sets the metric.
@@ -328,7 +327,40 @@ mod tests {
         assert_eq!(m.snapshot().api_up, 1);
         api.set_down(true);
         h.refresh().await;
+        assert_eq!(m.snapshot().api_up, 1, "fresh result: no new probe");
+        tokio::time::sleep(UP_TTL).await;
+        h.refresh().await;
         assert_eq!(m.snapshot().api_up, 0);
+    }
+
+    /// Review round 2: a request must not wait for two probes in a row.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waits_for_at_most_one_probe() {
+        let api = MemoryKubeApi::new();
+        api.set_latency(Duration::from_millis(1_400));
+        let (h, _) = health(false);
+        let h = Arc::new(h);
+        h.set(target(Some(Arc::new(api)), "in_cluster"));
+        let first = tokio::spawn({
+            let h = Arc::clone(&h);
+            async move { h.check().await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let refresh = tokio::spawn({
+            let h = Arc::clone(&h);
+            async move { h.refresh().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let start = Instant::now();
+        let second = h.check().await;
+        assert!(
+            start.elapsed() < Duration::from_millis(2_000),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(second.status, HealthStatus::Up);
+        first.await.unwrap();
+        refresh.await.unwrap();
     }
 
     #[test]
