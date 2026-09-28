@@ -463,7 +463,8 @@ pub struct KubernetesRuntime {
     mode: &'static str,
     namespace: Option<String>,
     cancel: CancellationToken,
-    /// Cancels the watches when the runtime is dropped with no shutdown.
+    /// If you drop the runtime without a shutdown, this guard cancels the
+    /// watches.
     _guard: tokio_util::sync::DropGuard,
     watches: Vec<JoinHandle<()>>,
     elector: Option<ElectorHandle>,
@@ -522,8 +523,8 @@ impl KubernetesRuntime {
         Arc::clone(&self.health)
     }
 
-    /// Writes `Stopping`, stops leader tasks, releases the lease, and stops
-    /// the watches.
+    /// Stops the leader tasks, releases the lease, writes `Stopping`, and
+    /// stops the watches, in this order.
     pub async fn shutdown(self) {
         // Order: stop leader tasks, then release the lease (another replica
         // can lead at once), then write the event.

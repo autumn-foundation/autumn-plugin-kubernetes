@@ -379,9 +379,9 @@ impl KubeApi for MemoryKubeApi {
         namespace: &str,
         name: &str,
     ) -> BoxStream<'static, Result<ConfigMapEvent, KubeError>> {
-        // Like the kube watcher with backoff: the stream never ends. While a
-        // fault holds, it yields an error each second. After it, it yields
-        // the current state again (a relist).
+        // Like the kube watcher with backoff, the stream does not end. While
+        // a fault is active, the stream sends one error each second. After
+        // the fault, it sends the current state again (a relist).
         let rx = self.config_map_sender(namespace, name).subscribe();
         let api = self.clone();
         Box::pin(futures::stream::unfold(
@@ -408,7 +408,7 @@ impl KubeApi for MemoryKubeApi {
                     if rx.changed().await.is_err() {
                         return None;
                     }
-                    // A fault may have woken us. Loop to check it first.
+                    // A fault can wake the stream. Check for a fault first.
                     relist = api.watch_fault().is_none();
                 }
             },

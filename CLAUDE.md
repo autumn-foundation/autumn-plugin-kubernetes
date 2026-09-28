@@ -17,7 +17,7 @@ Kubernetes plugin for autumn-web 0.7. Style for all docs and comments: ASD-STE10
 | `src/health.rs`, `src/metrics.rs` | Actuator health and Prometheus metrics. |
 | `src/manifest.rs` | YAML generator. |
 | `src/plugin.rs` | `KubernetesPlugin`, `KubernetesRuntime`. |
-| `tests/` | `leader.rs`, `plugin.rs`, `manifest.rs`, `contract.rs` (fake). `apiserver.rs` (real server). `common/contract.rs`: one contract for all `KubeApi`s. |
+| `tests/` | `leader.rs`, `plugin.rs`, `manifest.rs`, `contract.rs` (fake). `load.rs` (config loading through `examples/manifests`). `apiserver.rs` (real server). `common/contract.rs`: one contract for all `KubeApi`s. |
 | `scripts/envtest.sh` | Starts etcd and kube-apiserver. No containers. |
 | `docs/` | `plan.md`, `ac-evidence.md`, ADRs. |
 
@@ -61,4 +61,5 @@ K8S_OPENAPI_ENABLED_VERSION=1.32 cargo check --lib   # each of 1.32..1.36
   `KubernetesPlugin::start`, not with `TestApp`.
 - `TestApp` does not run shutdown hooks. `plugin::tests` calls the hook body.
 - autumn drops a shutdown hook future when the budget ends. The hook spawns
-  its work, so the work still ends in order.
+  its work, so the work continues in order while the process runs. If the
+  process exits first, the work stops, and the lease expires.

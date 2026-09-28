@@ -6,9 +6,10 @@
 //! and ConfigMap sync state. They have no URLs, tokens, versions, pod names,
 //! or error text: only a short error class.
 //!
-//! Results are reused (`UP_TTL`, `DOWN_TTL`), so health requests do not load
-//! the API server. The runtime also refreshes in the background, so the
-//! `kubernetes_api_up` metric stays current with no health requests.
+//! The indicator keeps each result for `UP_TTL` or `DOWN_TTL`. Thus health
+//! requests do not send many calls to the API server. The runtime also
+//! refreshes the result in the background. Thus the `kubernetes_api_up`
+//! metric stays current when there are no health requests.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};

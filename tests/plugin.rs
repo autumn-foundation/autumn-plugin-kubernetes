@@ -503,10 +503,9 @@ async fn losing_the_lease_writes_leader_lost() {
     rt.shutdown().await;
 }
 
-/// Review round 2: a dropped runtime must not free the lease while its
-/// leader tasks still clean up.
-#[tokio::test(start_paused = true)]
-async fn dropped_runtime_does_not_overlap_leader_tasks() {
+/// Leader-task overlap check. Replica `a` leads with a task that needs 3 s
+/// to clean up. `stop` ends `a`. Then `b` leads. At most one task may run.
+async fn overlap_after(stop: impl AsyncFnOnce(autumn_plugin_kubernetes::KubernetesRuntime)) {
     let api = MemoryKubeApi::new();
     let running = Arc::new(AtomicU32::new(0));
     let max_seen = Arc::new(AtomicU32::new(0));
@@ -524,34 +523,24 @@ async fn dropped_runtime_does_not_overlap_leader_tasks() {
             }
         })
     };
-    let pod_a = PodInfo {
-        name: Some("a".into()),
-        ..pod()
+    let start = |name: &str| {
+        KubernetesPlugin::with_config(config())
+            .with_api(api.clone())
+            .with_pod_info(PodInfo {
+                name: Some(name.into()),
+                ..pod()
+            })
+            .leader_task(task(&running, &max_seen))
+            .start(Box::leak(Box::new(AppState::for_test())))
     };
-    let pod_b = PodInfo {
-        name: Some("b".into()),
-        ..pod()
-    };
-    let a = KubernetesPlugin::with_config(config())
-        .with_api(api.clone())
-        .with_pod_info(pod_a)
-        .leader_task(task(&running, &max_seen))
-        .start(&AppState::for_test())
-        .await
-        .unwrap();
+    let a = start("a").await.unwrap();
     assert!(a.leadership().unwrap().wait_until_leader().await);
-    let b = KubernetesPlugin::with_config(config())
-        .with_api(api.clone())
-        .with_pod_info(pod_b)
-        .leader_task(task(&running, &max_seen))
-        .start(&AppState::for_test())
-        .await
-        .unwrap();
+    let b = start("b").await.unwrap();
     wait_until(Duration::from_secs(5), || {
         running.load(Ordering::SeqCst) == 1
     })
     .await;
-    drop(a);
+    stop(a).await;
     let lb = b.leadership().unwrap();
     wait_until(Duration::from_secs(30), || lb.is_leader()).await;
     wait_until(Duration::from_secs(5), || {
@@ -564,6 +553,197 @@ async fn dropped_runtime_does_not_overlap_leader_tasks() {
         "two leader tasks ran at once"
     );
     b.shutdown().await;
+}
+
+/// Review round 2: a dropped runtime must not free the lease while its
+/// leader tasks still clean up.
+#[tokio::test(start_paused = true)]
+async fn dropped_runtime_does_not_overlap_leader_tasks() {
+    overlap_after(async |rt| drop(rt)).await;
+}
+
+/// Review round 2: shutdown stops the tasks before it releases the lease.
+#[tokio::test(start_paused = true)]
+async fn shutdown_stops_tasks_before_the_release() {
+    overlap_after(async |rt| rt.shutdown().await).await;
+}
+
+/// A fault switch for one replica. The other replicas keep working.
+#[derive(Clone)]
+struct OwnFault {
+    inner: MemoryKubeApi,
+    down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OwnFault {
+    fn check(&self) -> Result<(), KubeError> {
+        if self.down.load(Ordering::SeqCst) {
+            Err(KubeError::Api("this replica is cut off".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl KubeApi for OwnFault {
+    fn server_version(&self) -> autumn_plugin_kubernetes::api::ApiFuture<'_, String> {
+        Box::pin(async move {
+            self.check()?;
+            self.inner.server_version().await
+        })
+    }
+    fn get_lease<'a>(
+        &'a self,
+        ns: &'a str,
+        name: &'a str,
+    ) -> autumn_plugin_kubernetes::api::ApiFuture<
+        'a,
+        Option<autumn_plugin_kubernetes::api::LeaseRecord>,
+    > {
+        Box::pin(async move {
+            self.check()?;
+            self.inner.get_lease(ns, name).await
+        })
+    }
+    fn create_lease<'a>(
+        &'a self,
+        ns: &'a str,
+        name: &'a str,
+        record: &'a autumn_plugin_kubernetes::api::LeaseRecord,
+    ) -> autumn_plugin_kubernetes::api::ApiFuture<'a, autumn_plugin_kubernetes::api::LeaseRecord>
+    {
+        Box::pin(async move {
+            self.check()?;
+            self.inner.create_lease(ns, name, record).await
+        })
+    }
+    fn replace_lease<'a>(
+        &'a self,
+        ns: &'a str,
+        name: &'a str,
+        record: &'a autumn_plugin_kubernetes::api::LeaseRecord,
+    ) -> autumn_plugin_kubernetes::api::ApiFuture<'a, autumn_plugin_kubernetes::api::LeaseRecord>
+    {
+        Box::pin(async move {
+            self.check()?;
+            self.inner.replace_lease(ns, name, record).await
+        })
+    }
+    fn watch_config_map(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> futures::stream::BoxStream<
+        'static,
+        Result<autumn_plugin_kubernetes::api::ConfigMapEvent, KubeError>,
+    > {
+        self.inner.watch_config_map(ns, name)
+    }
+    fn publish_event<'a>(
+        &'a self,
+        pod: &'a autumn_plugin_kubernetes::api::PodRef,
+        event: &'a autumn_plugin_kubernetes::api::PodEvent,
+    ) -> autumn_plugin_kubernetes::api::ApiFuture<'a, ()> {
+        self.inner.publish_event(pod, event)
+    }
+    fn default_namespace(&self) -> String {
+        self.inner.default_namespace()
+    }
+}
+
+/// Review round 2: a stuck task is aborted before another replica can lead.
+/// The plugin uses the stop timeout below the takeover gap (4 s < 5 s).
+#[tokio::test(start_paused = true)]
+async fn stuck_task_is_aborted_before_another_replica_leads() {
+    struct Running(Arc<AtomicU32>);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let api = MemoryKubeApi::new();
+    let running = Arc::new(AtomicU32::new(0));
+    let max_seen = Arc::new(AtomicU32::new(0));
+    let stuck = |running: &Arc<AtomicU32>, max_seen: &Arc<AtomicU32>| {
+        let (running, max_seen) = (Arc::clone(running), Arc::clone(max_seen));
+        LeaderTask::new("stuck", move |_s: AppState, _cancel| {
+            let (running, max_seen) = (Arc::clone(&running), Arc::clone(&max_seen));
+            async move {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                // Ignores the token. Only an abort drops this guard.
+                let _guard = Running(running);
+                std::future::pending::<()>().await;
+            }
+        })
+    };
+    let a_api = OwnFault {
+        inner: api.clone(),
+        down: Arc::default(),
+    };
+    let start = |api: Arc<dyn KubeApi>, name: &str| {
+        KubernetesPlugin::with_config(config())
+            .with_api_arc(api)
+            .with_pod_info(PodInfo {
+                name: Some(name.into()),
+                ..pod()
+            })
+            .leader_task(stuck(&running, &max_seen))
+            .start(Box::leak(Box::new(AppState::for_test())))
+    };
+    let a = start(Arc::new(a_api.clone()), "a").await.unwrap();
+    assert!(a.leadership().unwrap().wait_until_leader().await);
+    let b = start(Arc::new(api.clone()), "b").await.unwrap();
+    wait_until(Duration::from_secs(5), || {
+        running.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // Cut `a` off: its belief ends at the renew deadline; `b` takes over
+    // lease_duration after it last saw a change.
+    a_api.down.store(true, Ordering::SeqCst);
+    let lb = b.leadership().unwrap();
+    wait_until(Duration::from_secs(30), || lb.is_leader()).await;
+    wait_until(Duration::from_secs(5), || {
+        running.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "the stuck task overlapped"
+    );
+    drop(a);
+    b.shutdown().await;
+}
+
+/// Review round 2: the runtime refreshes health with no requests.
+#[tokio::test(start_paused = true)]
+async fn api_up_metric_changes_with_no_health_requests() {
+    let api = MemoryKubeApi::new();
+    let rt = plugin(&api, config())
+        .start(&AppState::for_test())
+        .await
+        .unwrap();
+    let m = rt.metrics();
+    wait_until(Duration::from_secs(1), || m.snapshot().api_up == 1).await;
+    api.set_down(true);
+    wait_until(Duration::from_secs(12), || m.snapshot().api_up == 0).await;
+    rt.shutdown().await;
+}
+
+/// Review round 2: a dropped runtime stops its ConfigMap watches.
+#[tokio::test(start_paused = true)]
+async fn dropped_runtime_stops_the_watches() {
+    let api = MemoryKubeApi::new();
+    let state = AppState::for_test();
+    let rt = plugin(&api, config()).start(&state).await.unwrap();
+    let store = ConfigMapStore::from_state(&state).unwrap();
+    wait_until(Duration::from_secs(5), || store.is_synced("flags")).await;
+    drop(rt);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    api.put_config_map(NS, "flags", BTreeMap::from([("k".into(), "v".into())]));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(store.value("flags", "k"), None, "the watch stopped");
 }
 
 #[tokio::test(start_paused = true)]

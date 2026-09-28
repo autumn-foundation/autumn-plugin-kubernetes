@@ -623,9 +623,9 @@ type TaskFn = Arc<dyn Fn(AppState, CancellationToken) -> BoxFuture<'static, ()> 
 ///
 /// The task starts when this replica becomes leader. The supervisor cancels
 /// the token when leadership stops or the app stops. The task must then
-/// return before the stop timeout: `lease_duration - renew_deadline` less 20%
-/// (4 s with the defaults), at most 10 s. After that time, the supervisor
-/// aborts the task. The task runs one time in each term. If it returns early,
+/// return before the stop timeout. The stop timeout is 80% of
+/// `lease_duration - renew_deadline`, and 10 s at most. With the defaults, it
+/// is 4 s. After that time, the supervisor aborts the task. The task runs one time in each term. If it returns early,
 /// it runs again only in the next term.
 #[derive(Clone)]
 pub struct LeaderTask {

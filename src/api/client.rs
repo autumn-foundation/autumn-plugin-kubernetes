@@ -111,31 +111,70 @@ pub(crate) fn kubeconfig_file_exists(
     )
 }
 
-/// Removes URL user info (`scheme://user:pass@host` to `scheme://***@host`).
+/// Query keys whose values `scrub` hides.
+const SECRET_KEYS: [&str; 5] = [
+    "token=",
+    "access_token=",
+    "password=",
+    "secret=",
+    "api_key=",
+];
+
+/// Removes credentials from error text: URL user info
+/// (`scheme://user:pass@host` to `scheme://***@host`, also with no scheme),
+/// secret query values, and bearer tokens. It works on words (split at
+/// white space). It can hide more than necessary, never less.
 pub(crate) fn scrub(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find("://") {
-        let (head, tail) = rest.split_at(i + 3);
-        out.push_str(head);
-        let end = tail
-            .find(|c: char| c == '/' || c == '"' || c == '\'' || c == ')' || c.is_whitespace())
-            .unwrap_or(tail.len());
-        let authority = &tail[..end];
-        if let Some(at) = authority.rfind('@') {
-            out.push_str("***");
-            out.push_str(&authority[at..]);
+    let mut after_bearer = false;
+    for piece in text.split_inclusive(char::is_whitespace) {
+        let word = piece.trim_end_matches(char::is_whitespace);
+        let space = &piece[word.len()..];
+        let clean = if after_bearer && !word.is_empty() {
+            "***".to_owned()
         } else {
-            out.push_str(authority);
-        }
-        rest = &tail[end..];
+            scrub_word(word)
+        };
+        after_bearer = word.eq_ignore_ascii_case("bearer");
+        out.push_str(&clean);
+        out.push_str(space);
     }
-    out.push_str(rest);
     out
 }
 
-/// Text for a `kube` error that is safe to log. Auth errors can hold exec
-/// plugin output; proxy errors can hold proxy credentials.
+/// Hides URL user info in one word.
+fn hide_user_info(word: &str) -> String {
+    if let Some(i) = word.find("://") {
+        let (head, rest) = word.split_at(i + 3);
+        return rest
+            .rfind('@')
+            .map_or_else(|| word.to_owned(), |at| format!("{head}***{}", &rest[at..]));
+    }
+    // `user:pass@host` with no scheme. A plain e-mail has no colon.
+    match word.rfind('@') {
+        Some(at) if word[..at].contains(':') => format!("***{}", &word[at..]),
+        _ => word.to_owned(),
+    }
+}
+
+fn scrub_word(word: &str) -> String {
+    let mut w = hide_user_info(word);
+    for key in SECRET_KEYS {
+        let mut from = 0;
+        while let Some(i) = w[from..].find(key) {
+            let start = from + i + key.len();
+            let end = w[start..]
+                .find(['&', '"', '\''])
+                .map_or(w.len(), |e| start + e);
+            w.replace_range(start..end, "***");
+            from = start + 3;
+        }
+    }
+    w
+}
+
+/// Text for a `kube` error that is safe to log. An auth error can contain
+/// exec plugin output. A proxy error can contain proxy credentials.
 pub(crate) fn describe(e: &kube::Error) -> String {
     match e {
         kube::Error::Auth(_) => "authentication failed".to_owned(),
@@ -158,9 +197,9 @@ pub(crate) fn map_error(e: &kube::Error, verb: &str, resource: &str) -> KubeErro
 
 fn map_status(status: &kube::core::Status, verb: &str, resource: &str) -> KubeError {
     if status.is_conflict() || status.is_already_exists() {
-        KubeError::Conflict(status.message.clone())
+        KubeError::Conflict(scrub(&status.message))
     } else if status.is_not_found() {
-        KubeError::NotFound(status.message.clone())
+        KubeError::NotFound(scrub(&status.message))
     } else if status.is_forbidden() {
         KubeError::Forbidden {
             verb: verb.to_owned(),
@@ -445,6 +484,28 @@ mod tests {
         assert_eq!(scrub("a://b@c d://e"), "a://***@c d://e");
         assert_eq!(scrub("no url"), "no url");
         assert_eq!(scrub("end://u@h"), "end://***@h");
+    }
+
+    #[test]
+    fn scrub_hides_more_credential_forms() {
+        // Review round 2: forms that passed through before.
+        assert_eq!(
+            scrub("proxy http://u:pa/ss@proxy:3128 failed"),
+            "proxy http://***@proxy:3128 failed"
+        );
+        assert_eq!(scrub("dial u:pw@proxy:3128"), "dial ***@proxy:3128");
+        assert_eq!(
+            scrub("GET https://h/api?token=abc123&x=1 failed"),
+            "GET https://h/api?token=***&x=1 failed"
+        );
+        assert_eq!(
+            scrub("header Bearer abc.def rejected"),
+            "header Bearer *** rejected"
+        );
+        assert_eq!(scrub("\"https://u:p@h\""), "\"https://***@h\"");
+        // Not credentials: stay as they are.
+        assert_eq!(scrub("mail me@example.com"), "mail me@example.com");
+        assert_eq!(scrub("https://[::1]:6443/x"), "https://[::1]:6443/x");
     }
 
     #[test]

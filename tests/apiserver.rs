@@ -392,6 +392,19 @@ async fn generated_rbac_is_enough_and_minimal() {
         .await
         .unwrap_err();
     assert!(matches!(err, KubeError::Forbidden { .. }), "{err}");
+    // A POST create cannot match a name, so a name-limited `create` denies
+    // it, even for a name the Role lists.
+    let raw: Api<k8s_openapi::api::coordination::v1::Lease> =
+        Api::namespaced(client(&dir, "app.kubeconfig").await, ns);
+    let post: k8s_openapi::api::coordination::v1::Lease = serde_json::from_value(
+        serde_json::json!({"metadata": {"name": "shop-leader"}, "spec": {}}),
+    )
+    .unwrap();
+    let denied = raw.create(&PostParams::default(), &post).await.unwrap_err();
+    assert!(
+        matches!(denied, kube::Error::Api(ref s) if s.is_forbidden()),
+        "{denied}"
+    );
 
     other_rt.shutdown().await;
 }

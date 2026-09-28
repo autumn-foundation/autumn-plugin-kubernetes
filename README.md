@@ -129,7 +129,7 @@ The default is `/actuator/health` only, so an API outage does not stop traffic.
 | `detached` | No kubeconfig and no pod, and `required = false`. Leader tasks do not run unless `lead_when_detached = true`. |
 | `disabled` | `enabled = false`. |
 
-A kubeconfig that exists but does not load is an error. It does not give `detached`.
+Outside a pod, a kubeconfig that exists but does not load is an error. It does not give `detached`. In a pod, kube then uses the in-cluster config, but the mode still shows `kubeconfig`.
 
 Proxies (kubeconfig mode only; in-cluster mode uses no proxy):
 

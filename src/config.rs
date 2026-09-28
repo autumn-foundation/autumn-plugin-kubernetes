@@ -226,7 +226,8 @@ fn apply_env(
 }
 
 /// `dir/file` if it exists, else `file` in the working directory. autumn-web
-/// does the same, so a build path baked into the binary does not hide files.
+/// does the same. Thus a build path in the binary does not stop the plugin
+/// from finding files.
 pub(crate) fn find_file(dir: &Path, file: &str) -> std::path::PathBuf {
     let candidate = dir.join(file);
     if candidate.exists() {
@@ -394,8 +395,10 @@ impl KubernetesConfig {
             .var("AUTUMN_MANIFEST_DIR")
             .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from);
         // `.env` first, then the process env, so the process env wins.
+        // The error text can repeat the `.env` line (a secret). Show only
+        // the file and the line number.
         let mut env = autumn_web::dotenv::resolve_process_dotenv()
-            .map_err(|e| config_err(format!(".env: {e}")))?;
+            .map_err(|e| config_err(format!(".env: {}:{}: not valid", e.path.display(), e.line)))?;
         env.extend(
             std::env::vars_os()
                 .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),

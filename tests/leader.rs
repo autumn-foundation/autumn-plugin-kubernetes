@@ -688,3 +688,80 @@ async fn a_lost_create_race_is_a_conflict_not_an_error() {
     a.stop().await;
     b.stop().await;
 }
+
+/// Review round 2: a dead elector that was leading never reads as leader,
+/// also through `wait_until_leader`.
+#[tokio::test(start_paused = true)]
+async fn wait_until_leader_is_false_after_the_leader_elector_dies() {
+    let api = MemoryKubeApi::new();
+    let a = elect(&api, "a");
+    let la = a.leadership();
+    assert!(la.wait_until_leader().await);
+    a.abort();
+    tokio::task::yield_now().await;
+    assert!(!la.wait_until_leader().await);
+    assert!(!la.is_leader());
+}
+
+/// Review round 2: leader tasks stop at the belief deadline even when the
+/// elector cannot run (its runtime is blocked).
+#[test]
+fn tasks_stop_at_deadline_even_if_the_elector_is_starved() {
+    use std::sync::mpsc;
+    let api = MemoryKubeApi::new();
+    let (tx, rx) = mpsc::channel();
+    let (block_tx, block_rx) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let cfg = autumn_plugin_kubernetes::config::LeaderElectionConfig {
+                lease_duration_secs: 3,
+                renew_deadline_secs: 2,
+                retry_period_secs: 1,
+                ..leader_config()
+            };
+            let h = LeaderElector::new(Arc::new(api), NS, "a", cfg)
+                .unwrap()
+                .start();
+            assert!(h.leadership().wait_until_leader().await);
+            tx.send(h.leadership()).unwrap();
+            block_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_secs(4));
+            h.abort();
+        });
+    });
+    let lead = rx.recv().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancelled_after = rt.block_on(async move {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+        let task = LeaderTask::new("t", move |_s: AppState, cancel| {
+            let done_tx = Arc::clone(&done_tx);
+            async move {
+                cancel.cancelled().await;
+                let tx = done_tx.lock().unwrap().take();
+                if let Some(tx) = tx {
+                    let _ = tx.send(std::time::Instant::now());
+                }
+            }
+        });
+        let tasks = LeaderTasks::start(lead, vec![task], AppState::for_test(), S(1));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        block_tx.send(()).unwrap();
+        let blocked_at = std::time::Instant::now();
+        let at = tokio::time::timeout(S(5), done_rx).await.unwrap().unwrap();
+        tasks.stop().await;
+        at.duration_since(blocked_at)
+    });
+    assert!(
+        cancelled_after < Duration::from_millis(2_300),
+        "{cancelled_after:?}"
+    );
+    worker.join().unwrap();
+}
