@@ -1,6 +1,6 @@
 # autumn-plugin-kubernetes
 
-Kubernetes plugin for [autumn-web](https://autumn-web.app) 0.7.
+Kubernetes plugin for [autumn-web](https://autumn-web.app) 0.8.
 
 - **Pod identity** from the Downward API.
 - **Leader election** on a `coordination.k8s.io/v1` Lease. Leader tasks run on one replica only.
@@ -114,7 +114,7 @@ The plugin loads config like autumn-web. The layers, from low to high:
 
 Each file comes from `$AUTUMN_MANIFEST_DIR`. If the file is not there, the plugin reads it from the working directory.
 Env example: `AUTUMN_KUBERNETES__LEADER_ELECTION__ENABLED=true`. Lists are comma separated.
-With `server.strict_config`, autumn 0.7 accepts `[kubernetes]` only at the top level. Put profile values in `autumn-<profile>.toml`.
+With `server.strict_config`, autumn 0.8 accepts `[kubernetes]` only at the top level. Put profile values in `autumn-<profile>.toml`.
 
 `KubernetesPlugin::readiness(true)` puts the health indicator in `/ready`.
 The default is `/actuator/health` only, so an API outage does not stop traffic.

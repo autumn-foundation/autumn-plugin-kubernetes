@@ -12,7 +12,7 @@
 //! Files: each file is read from `$AUTUMN_MANIFEST_DIR` if it is there,
 //! else from the working directory (like autumn-web).
 //!
-//! With `server.strict_config`, autumn 0.7 accepts `[kubernetes]` only at the
+//! With `server.strict_config`, autumn 0.8 accepts `[kubernetes]` only at the
 //! top level. Put profile values in `autumn-<profile>.toml`, not in
 //! `[profile.<name>.kubernetes]`.
 
