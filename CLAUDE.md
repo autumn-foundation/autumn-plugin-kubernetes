@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Kubernetes plugin for autumn-web 0.7. Style for all docs and comments: ASD-STE100.
+Kubernetes plugin for autumn-web 0.8. Style for all docs and comments: ASD-STE100.
 
 ## Layout
 
@@ -54,7 +54,7 @@ K8S_OPENAPI_ENABLED_VERSION=1.32 cargo check --lib   # each of 1.32..1.36
 - Leader belief must end before a takeover is possible. Do not extend belief on an error.
 - Tests that clear `proxy_url` do it only for the loopback test server.
 
-## Autumn API notes (0.7.0)
+## Autumn API notes (0.8.0)
 
 - `TestApp` runs startup hooks on a runtime that ends after startup. Tasks that
   the plugin spawns (elector, watches) stop with it. Test runtime behavior with
