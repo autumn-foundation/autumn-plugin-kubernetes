@@ -1,6 +1,6 @@
 # autumn-plugin-kubernetes
 
-Kubernetes plugin for [autumn-web](https://autumn-web.app) 0.8.
+Kubernetes plugin for [autumn-web](https://autumn-web.app) 0.9.
 
 - **Pod identity** from the Downward API.
 - **Leader election** on a `coordination.k8s.io/v1` Lease. Leader tasks run on one replica only.
