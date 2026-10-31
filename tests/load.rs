@@ -35,15 +35,14 @@ ready_path = "/readyz"
 
 [kubernetes]
 namespace = "base"
-
-[profile.production.kubernetes]
-events = false
 "#,
     )
     .unwrap();
     std::fs::write(
         dir.join("autumn-prod.toml"),
-        "[kubernetes.leader_election]\nenabled = true\nlease_name = \"shop-leader\"\n",
+        // autumn-web 0.9 turns on `strict_config` in prod. It then refuses
+        // `[profile.<name>.kubernetes]` in `autumn.toml`, so profile values go here.
+        "[kubernetes]\nevents = false\n\n[kubernetes.leader_election]\nenabled = true\nlease_name = \"shop-leader\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -75,7 +74,7 @@ events = false
     assert!(!yaml.contains("- flags"), ".env must not apply:\n{yaml}");
     assert!(
         !yaml.contains("events.k8s.io"),
-        "[profile.production]:\n{yaml}"
+        "autumn-prod.toml events:\n{yaml}"
     );
     // 5 (preStop) + 5 (prestop grace) + 60 (shutdown) + 10 (buffer).
     assert!(yaml.contains("terminationGracePeriodSeconds: 80"), "{yaml}");
