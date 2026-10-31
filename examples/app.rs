@@ -77,11 +77,14 @@ async fn main() {
         },
         ..KubernetesConfig::default()
     };
-    autumn_web::app()
-        .routes(routes![whoami, beta])
-        .plugin(
-            KubernetesPlugin::with_config(config).leader_task(LeaderTask::new("report", report)),
-        )
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .routes(routes![whoami, beta])
+            .plugin(
+                KubernetesPlugin::with_config(config)
+                    .leader_task(LeaderTask::new("report", report)),
+            )
+            .run(),
+    )
+    .await;
 }
