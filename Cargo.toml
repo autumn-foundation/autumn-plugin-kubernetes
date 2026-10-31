@@ -1,6 +1,6 @@
 [package]
 name = "autumn-plugin-kubernetes"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88.0"
 description = "Kubernetes plugin for autumn-web: pod identity, Lease leader election, live ConfigMaps, Events, health, metrics, and manifests"

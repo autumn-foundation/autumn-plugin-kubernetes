@@ -15,7 +15,7 @@ It uses [`kube`](https://kube.rs) 4 and `k8s-openapi` 0.28.
 
 ```toml
 [dependencies]
-autumn-plugin-kubernetes = "0.1"
+autumn-plugin-kubernetes = "0.2"
 # Your app picks the Kubernetes API version (k8s-openapi rule).
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 ```
