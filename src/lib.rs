@@ -19,3 +19,8 @@ pub use error::KubeError;
 pub use leader::{ElectorHandle, LeaderElector, LeaderState, LeaderTask, LeaderTasks, Leadership};
 pub use plugin::{KubernetesPlugin, KubernetesRuntime};
 pub use pod::PodInfo;
+
+/// Compiles the Rust snippets of the README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

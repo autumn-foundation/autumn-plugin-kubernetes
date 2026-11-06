@@ -66,6 +66,8 @@ jobs:
           KUBE_IT_REQUIRED: "1"
           AUTUMN_K8S_EXAMPLES_DIR: target/debug/examples
         run: cargo llvm-cov --all-targets --fail-under-lines 85 --lcov --output-path lcov.info
+      - name: README and API doc examples
+        run: cargo test --locked --doc
       - uses: actions/upload-artifact@v4
         with:
           name: lcov
