@@ -50,7 +50,7 @@ fn from_config_reads_autumn_and_kubernetes_sections() {
     autumn.server.shutdown_timeout_secs = 20;
     autumn.server.prestop_grace_secs = 3;
     autumn.health.ready_path = "/readyz".into();
-    autumn.role = ProcessRole::Worker;
+    autumn.role = ProcessRole::Worker.into();
     let mut kube = KubernetesConfig::default();
     kube.namespace = "shop".into();
     kube.leader_election.enabled = true;
@@ -61,7 +61,7 @@ fn from_config_reads_autumn_and_kubernetes_sections() {
     assert_eq!(s.shutdown_timeout_secs, 20);
     assert_eq!(s.prestop_grace_secs, 3);
     assert_eq!(s.probes.ready, "/readyz");
-    assert_eq!(s.role, Some(ProcessRole::Worker));
+    assert_eq!(s.role, Some(ProcessRole::Worker.into()));
     assert_eq!(s.namespace, "shop");
     assert_eq!(s.lease_name.as_deref(), Some("l"));
     assert_eq!(s.config_maps, vec!["flags".to_owned()]);
@@ -185,7 +185,7 @@ fn api_access_mounts_the_token_even_with_no_rules() {
 #[test]
 fn deployment_wires_probes_env_prestop_and_grace() {
     let mut s = full_spec();
-    s.role = Some(ProcessRole::Web);
+    s.role = Some(ProcessRole::Web.into());
     s.env.insert("RUST_LOG".into(), "info".into());
     let objs = s.objects().unwrap();
     let d: Deployment = serde_json::from_value(find(&objs, "Deployment").clone()).unwrap();
@@ -345,4 +345,26 @@ fn role_binding_binds_the_service_account() {
         ("ServiceAccount", "shop")
     );
     assert_eq!(subject.namespace.as_deref(), Some("prod"));
+}
+
+#[test]
+fn a_role_preset_name_reaches_autumn_role() {
+    let mut autumn = AutumnConfig::default();
+    autumn.role = "ingest".parse().unwrap();
+    let s = ManifestSpec::from_config("shop", "img", &autumn, &KubernetesConfig::default());
+    assert_eq!(
+        s.role.as_ref().map(autumn_web::RoleName::as_str),
+        Some("ingest")
+    );
+    let objs = s.objects().unwrap();
+    let d: Deployment = serde_json::from_value(find(&objs, "Deployment").clone()).unwrap();
+    let pod = d.spec.unwrap().template.spec.unwrap();
+    let role = pod.containers[0]
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == "AUTUMN_ROLE")
+        .and_then(|e| e.value.clone());
+    assert_eq!(role.as_deref(), Some("ingest"));
 }
