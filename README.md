@@ -1,6 +1,6 @@
 # autumn-plugin-kubernetes
 
-Kubernetes plugin for [autumn-web](https://autumn-web.app) 0.9.
+Kubernetes plugin for [autumn-web](https://autumn-web.app) 0.10.
 
 - **Pod identity** from the Downward API.
 - **Leader election** on a `coordination.k8s.io/v1` Lease. Leader tasks run on one replica only.
@@ -15,7 +15,7 @@ It uses [`kube`](https://kube.rs) 4 and `k8s-openapi` 0.28.
 
 ```toml
 [dependencies]
-autumn-plugin-kubernetes = "0.2"
+autumn-plugin-kubernetes = "0.3"
 # Your app picks the Kubernetes API version (k8s-openapi rule).
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 ```

@@ -40,7 +40,7 @@ namespace = "base"
     .unwrap();
     std::fs::write(
         dir.join("autumn-prod.toml"),
-        // autumn-web 0.9 turns on `strict_config` in prod. It then refuses
+        // autumn-web turns on `strict_config` in prod. It then refuses
         // `[profile.<name>.kubernetes]` in `autumn.toml`, so profile values go here.
         "[kubernetes]\nevents = false\n\n[kubernetes.leader_election]\nenabled = true\nlease_name = \"shop-leader\"\n",
     )

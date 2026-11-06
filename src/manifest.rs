@@ -10,8 +10,8 @@
 
 use std::collections::BTreeMap;
 
-use autumn_web::ProcessRole;
 use autumn_web::config::AutumnConfig;
+use autumn_web::{ProcessRole, RoleName};
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
@@ -62,8 +62,9 @@ pub struct ManifestSpec {
     pub port: u16,
     /// Replicas.
     pub replicas: i32,
-    /// Process role. `None`: `combined` (no `AUTUMN_ROLE` env).
-    pub role: Option<ProcessRole>,
+    /// Process role: a built-in role or a `[roles.<name>]` preset. `None`:
+    /// `combined` (no `AUTUMN_ROLE` env).
+    pub role: Option<RoleName>,
     /// Autumn profile for the pods (`AUTUMN_ENV`). Use the profile that made
     /// this spec, so the grace period matches the shutdown timeout.
     pub profile: Option<String>,
@@ -146,7 +147,7 @@ impl ManifestSpec {
             ready: autumn.health.ready_path.clone(),
             startup: autumn.health.startup_path.clone(),
         };
-        s.role = (autumn.role != ProcessRole::Combined).then_some(autumn.role);
+        s.role = (autumn.role != ProcessRole::Combined).then(|| autumn.role.clone());
         s.profile = autumn.profile_name().map(str::to_owned);
         if !kube.namespace.is_empty() {
             s.namespace.clone_from(&kube.namespace);
@@ -402,7 +403,7 @@ impl ManifestSpec {
             ("AUTUMN_SERVER__HOST".to_owned(), "0.0.0.0".to_owned()),
             ("AUTUMN_SERVER__PORT".to_owned(), self.port.to_string()),
         ]);
-        if let Some(role) = self.role {
+        if let Some(role) = &self.role {
             plain.insert("AUTUMN_ROLE".to_owned(), role.as_str().to_owned());
         }
         if let Some(profile) = &self.profile {

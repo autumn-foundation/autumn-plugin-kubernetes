@@ -8,7 +8,7 @@ use std::time::Duration;
 use autumn_web::actuator::{HealthIndicator, MetricsSource};
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
-use autumn_web::{AppState, ProcessRole};
+use autumn_web::{AppState, Role};
 use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -153,21 +153,22 @@ impl KubernetesPlugin {
     /// # Errors
     /// Returns a config or connection error.
     pub async fn start(self, state: &AppState) -> Result<KubernetesRuntime, KubeError> {
-        self.start_with_role(state, state.role()).await
+        self.start_with_role(state, state.role().clone()).await
     }
 
-    /// Starts the plugin as if the process has `role`.
+    /// Starts the plugin as if the process has `role`. A
+    /// [`ProcessRole`](autumn_web::ProcessRole) converts into a [`Role`].
     ///
     /// # Errors
     /// Same as [`Self::start`].
     pub async fn start_with_role(
         self,
         state: &AppState,
-        role: ProcessRole,
+        role: impl Into<Role>,
     ) -> Result<KubernetesRuntime, KubeError> {
         let metrics = Arc::new(KubernetesMetrics::new());
         let health = Arc::new(KubernetesHealth::new(self.readiness, Arc::clone(&metrics)));
-        self.start_inner(state, role, metrics, health).await
+        self.start_inner(state, &role.into(), metrics, health).await
     }
 
     /// Connects with the connector or the default client.
@@ -191,7 +192,7 @@ impl KubernetesPlugin {
     async fn start_inner(
         self,
         state: &AppState,
-        role: ProcessRole,
+        role: &Role,
         metrics: Arc<KubernetesMetrics>,
         health: Arc<KubernetesHealth>,
     ) -> Result<KubernetesRuntime, KubeError> {
@@ -258,7 +259,7 @@ impl KubernetesPlugin {
             store
         });
         let le = &config.leader_election;
-        let (elector, tasks, leadership) = if le.enabled && le.campaigns_for(role) {
+        let (elector, tasks, leadership) = if le.enabled && le.campaigns_for(role.base()) {
             let identity = if le.identity.is_empty() {
                 default_identity(&pod)
             } else {
@@ -284,7 +285,7 @@ impl KubernetesPlugin {
         } else {
             if le.enabled {
                 tracing::info!(
-                    role = role.as_str(),
+                    role = role.name(),
                     "kubernetes: this role does not take part in leader election"
                 );
             }
@@ -320,7 +321,7 @@ impl KubernetesPlugin {
             cancel.clone(),
         )));
         events.spawn(events::started(mode));
-        tracing::info!(mode, namespace = %namespace, role = role.as_str(), "kubernetes plugin started");
+        tracing::info!(mode, namespace = %namespace, role = role.name(), "kubernetes plugin started");
         Ok(KubernetesRuntime {
             mode,
             namespace: Some(namespace),
@@ -347,13 +348,15 @@ impl KubernetesPlugin {
         config: &KubernetesConfig,
         pod: &PodInfo,
         state: &AppState,
-        role: ProcessRole,
+        role: &Role,
         metrics: Arc<KubernetesMetrics>,
         health: Arc<KubernetesHealth>,
     ) -> KubernetesRuntime {
         let le = &config.leader_election;
-        let lead =
-            mode == "detached" && le.enabled && le.lead_when_detached && le.campaigns_for(role);
+        let lead = mode == "detached"
+            && le.enabled
+            && le.lead_when_detached
+            && le.campaigns_for(role.base());
         let (local_leader, leadership, tasks) = if lead {
             let identity = if le.identity.is_empty() {
                 default_identity(pod)
