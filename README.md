@@ -23,8 +23,10 @@ k8s-openapi = { version = "0.28", features = ["v1_32"] }
 You can also turn on the `latest` feature of this crate. Use it in apps only, not in libraries.
 Supported: Kubernetes 1.32 to 1.36.
 
-```rust
+```rust,no_run
 use autumn_plugin_kubernetes::{KubernetesPlugin, LeaderTask};
+use autumn_web::prelude::*;
+use tokio_util::sync::CancellationToken;
 
 #[autumn_web::main]
 async fn main() {
@@ -35,7 +37,7 @@ async fn main() {
         .await;
 }
 
-async fn sweep(state: AppState, cancel: CancellationToken) {
+async fn sweep(_state: AppState, _cancel: CancellationToken) {
     // Runs on the leader only. Return before the stop timeout after
     // the plugin cancels `cancel` (4 s with the default timing).
 }
@@ -140,11 +142,16 @@ Proxies (kubeconfig mode only; in-cluster mode uses no proxy):
 ## Use in handlers
 
 ```rust
-let pod = PodInfo::from_state(&state);                 // Option<Arc<PodInfo>>
-let lead = Leadership::from_state(&state);             // Option<Arc<Leadership>>
-let flags = ConfigMapStore::from_state(&state);        // Option<Arc<ConfigMapStore>>
-let beta: Option<bool> = flags.and_then(|s| s.json("flags", "beta").ok().flatten());
-let client = state.extension::<kube::Client>();        // your own API calls
+use autumn_plugin_kubernetes::{ConfigMapStore, Leadership, PodInfo};
+use autumn_web::AppState;
+
+fn read(state: &AppState) {
+    let pod = PodInfo::from_state(state);                 // Option<Arc<PodInfo>>
+    let lead = Leadership::from_state(state);             // Option<Arc<Leadership>>
+    let flags = ConfigMapStore::from_state(state);        // Option<Arc<ConfigMapStore>>
+    let beta: Option<bool> = flags.and_then(|s| s.json("flags", "beta").ok().flatten());
+    let client = state.extension::<kube::Client>();       // your own API calls
+}
 ```
 
 ## Health and metrics
@@ -185,7 +192,9 @@ The example loads your real Autumn config. It needs the pod profile (`--profile`
 ## Tests
 
 ```rust
+use autumn_plugin_kubernetes::KubernetesPlugin;
 use autumn_plugin_kubernetes::api::MemoryKubeApi;
+
 let api = MemoryKubeApi::new();
 let plugin = KubernetesPlugin::new().with_api(api.clone());
 ```

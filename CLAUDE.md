@@ -41,6 +41,8 @@ K8S_OPENAPI_ENABLED_VERSION=1.32 cargo check --lib   # each of 1.32..1.36
 
 ## Rules
 
+- README Rust snippets are doctests. Make them compile; use `no_run`, not `ignore`.
+  `tests/doc_snippets.rs` checks the TOML snippets and the version pins in the docs.
 - Write the test first. See it fail. Then write the code.
 - A change to `src/policy.rs` needs the same change in `verus/policy.rs`. Run Verus.
 - Only `src/api/` calls Kubernetes. Other code uses `KubeApi`.
