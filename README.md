@@ -1,6 +1,6 @@
 # autumn-plugin-kubernetes
 
-Kubernetes plugin for [autumn-web](https://autumn-web.app) 0.10.
+Kubernetes plugin for [autumn-web](https://autumn-web.app) 0.11.
 
 - **Pod identity** from the Downward API.
 - **Leader election** on a `coordination.k8s.io/v1` Lease. Leader tasks run on one replica only.
@@ -15,7 +15,7 @@ It uses [`kube`](https://kube.rs) 4 and `k8s-openapi` 0.28.
 
 ```toml
 [dependencies]
-autumn-plugin-kubernetes = "0.3"
+autumn-plugin-kubernetes = "0.4"
 # Your app picks the Kubernetes API version (k8s-openapi rule).
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 ```
@@ -100,10 +100,21 @@ renew_deadline_secs = 10
 retry_period_secs = 2   # rule: renew > 1.2 * retry, lease > renew
 release_on_shutdown = true
 lead_when_detached = false  # local development only
-roles = []              # [] = all; else "combined", "web", "worker"
+roles = []              # [] = roles that run kubernetes.leader; else "combined", "web", "worker"
 
 [kubernetes.config_maps]
 watch = []              # ConfigMap names in the namespace
+```
+
+Leader election follows the process role. With an empty `roles` list, a
+process takes part when its role runs the `kubernetes.leader` capability.
+Its parent is `scheduler`, so `combined` and `worker` take part, and `web`
+does not. A named role can turn it off:
+
+```toml
+[roles.cron]
+base = "worker"
+capabilities = { "kubernetes.leader" = false }
 ```
 
 The plugin loads config like autumn-web. The layers, from low to high:

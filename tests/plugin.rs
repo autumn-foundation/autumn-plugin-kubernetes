@@ -125,6 +125,20 @@ async fn leader_runtime_end_to_end() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn web_role_with_no_list_does_not_campaign() {
+    let api = MemoryKubeApi::new();
+    let state = AppState::for_test();
+    let rt = plugin(&api, config())
+        .start_with_role(&state, ProcessRole::Web)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(rt.leadership().is_none(), "web runs no kubernetes.leader");
+    assert!(api.lease(NS, LEASE).is_none(), "no lease write");
+    rt.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn role_not_listed_does_not_campaign() {
     let api = MemoryKubeApi::new();
     let mut cfg = config();
