@@ -17,7 +17,7 @@ pub use config::KubernetesConfig;
 pub use configmap::ConfigMapStore;
 pub use error::KubeError;
 pub use leader::{ElectorHandle, LeaderElector, LeaderState, LeaderTask, LeaderTasks, Leadership};
-pub use plugin::{KubernetesPlugin, KubernetesRuntime};
+pub use plugin::{KUBERNETES_LEADER, KubernetesPlugin, KubernetesRuntime};
 pub use pod::PodInfo;
 
 /// Compiles the Rust snippets of the README as doctests.

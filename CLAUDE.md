@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Kubernetes plugin for autumn-web 0.10. Style for all docs and comments: ASD-STE100.
+Kubernetes plugin for autumn-web 0.11. Style for all docs and comments: ASD-STE100.
 
 ## Layout
 

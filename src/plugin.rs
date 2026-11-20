@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use autumn_web::actuator::{HealthIndicator, MetricsSource};
 use autumn_web::app::AppBuilder;
+use autumn_web::background::PluginCapability;
 use autumn_web::plugin::Plugin;
-use autumn_web::{AppState, Role};
+use autumn_web::{AppState, Capability, Role};
 use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +26,15 @@ use crate::pod::PodInfo;
 
 /// Plugin name for duplicate detection.
 pub const PLUGIN_NAME: &str = "autumn-plugin-kubernetes";
+
+/// The capability of the leader election and the leader tasks.
+///
+/// A role runs it when it runs the scheduler (`combined`, `worker`). A named role can
+/// turn it off: `[roles.<name>] capabilities = { "kubernetes.leader" = false }`.
+/// A `leader_election.roles` list wins over it.
+pub const KUBERNETES_LEADER: PluginCapability =
+    PluginCapability::new("kubernetes.leader", Capability::Scheduler);
+
 /// Time limit for the startup API check when `required = true`.
 pub const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper limit for leader tasks to return after their token is cancelled.
@@ -259,7 +269,7 @@ impl KubernetesPlugin {
             store
         });
         let le = &config.leader_election;
-        let (elector, tasks, leadership) = if le.enabled && le.campaigns_for(role.base()) {
+        let (elector, tasks, leadership) = if le.enabled && le.campaigns_for(role) {
             let identity = if le.identity.is_empty() {
                 default_identity(&pod)
             } else {
@@ -353,10 +363,8 @@ impl KubernetesPlugin {
         health: Arc<KubernetesHealth>,
     ) -> KubernetesRuntime {
         let le = &config.leader_election;
-        let lead = mode == "detached"
-            && le.enabled
-            && le.lead_when_detached
-            && le.campaigns_for(role.base());
+        let lead =
+            mode == "detached" && le.enabled && le.lead_when_detached && le.campaigns_for(role);
         let (local_leader, leadership, tasks) = if lead {
             let identity = if le.identity.is_empty() {
                 default_identity(pod)
@@ -580,6 +588,7 @@ impl Plugin for KubernetesPlugin {
         );
         let stop = Arc::clone(&started);
         app.config_section(SECTION)
+            .plugin_capability(KUBERNETES_LEADER)
             .metrics_source("kubernetes", metrics as Arc<dyn MetricsSource>)
             .health_indicator("kubernetes", health as Arc<dyn HealthIndicator>)
             .on_startup(move |state| {

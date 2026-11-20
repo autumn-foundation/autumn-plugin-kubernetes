@@ -69,7 +69,8 @@ pub struct LeaderElectionConfig {
     /// With no cluster (detached), act as leader so leader tasks run. For
     /// local development only. Default: `false`.
     pub lead_when_detached: bool,
-    /// Process roles that take part (`combined`, `web`, `worker`). Empty: all.
+    /// Process roles that take part (`combined`, `web`, `worker`). Empty: each
+    /// role that runs the `kubernetes.leader` capability (parent `scheduler`).
     /// A leader task runs only on a replica that takes part.
     pub roles: Vec<String>,
 }
@@ -113,13 +114,18 @@ impl Default for LeaderElectionConfig {
 
 impl LeaderElectionConfig {
     /// Returns `true` when a process with `role` takes part in the election.
+    ///
+    /// A `roles` list wins: the base role of `role` must be in it. With no
+    /// list, the role decides: it takes part when it runs
+    /// [`KUBERNETES_LEADER`](crate::KUBERNETES_LEADER).
     #[must_use]
-    pub fn campaigns_for(&self, role: autumn_web::ProcessRole) -> bool {
-        self.roles.is_empty()
-            || self
-                .roles
-                .iter()
-                .any(|r| autumn_web::ProcessRole::from_env_value(r) == Some(role))
+    pub fn campaigns_for(&self, role: &autumn_web::Role) -> bool {
+        if self.roles.is_empty() {
+            return role.runs_plugin(crate::plugin::KUBERNETES_LEADER);
+        }
+        self.roles
+            .iter()
+            .any(|r| autumn_web::ProcessRole::from_env_value(r) == Some(role.base()))
     }
 
     /// Lease duration in milliseconds.
@@ -709,13 +715,38 @@ mod tests {
 
     #[test]
     fn roles_gate_the_campaign() {
-        use autumn_web::ProcessRole;
+        use autumn_web::{ProcessRole, Role};
         let mut le = LeaderElectionConfig::default();
-        assert!(le.campaigns_for(ProcessRole::Web), "empty list: all roles");
         le.roles = vec!["worker".into(), "Combined".into()];
-        assert!(le.campaigns_for(ProcessRole::Worker));
-        assert!(le.campaigns_for(ProcessRole::Combined));
-        assert!(!le.campaigns_for(ProcessRole::Web));
+        assert!(le.campaigns_for(&Role::from(ProcessRole::Worker)));
+        assert!(le.campaigns_for(&Role::from(ProcessRole::Combined)));
+        assert!(!le.campaigns_for(&Role::from(ProcessRole::Web)));
+        le.roles = vec!["web".into()];
+        assert!(
+            le.campaigns_for(&Role::from(ProcessRole::Web)),
+            "the list wins"
+        );
+    }
+
+    /// The role of a config with `lines`.
+    fn role(lines: &str) -> autumn_web::Role {
+        let config: autumn_web::config::AutumnConfig =
+            toml::from_str(lines).expect("config parses");
+        config.resolve_role().expect("role resolves")
+    }
+
+    #[test]
+    fn with_no_list_the_leader_capability_decides() {
+        let le = LeaderElectionConfig::default();
+        assert!(le.campaigns_for(&role("role = \"combined\"")));
+        assert!(le.campaigns_for(&role("role = \"worker\"")));
+        assert!(
+            !le.campaigns_for(&role("role = \"web\"")),
+            "web runs no scheduler"
+        );
+        let off = "role = \"cron\"\n[roles.cron]\nbase = \"worker\"\n\
+                   capabilities = { \"kubernetes.leader\" = false }\n";
+        assert!(!le.campaigns_for(&role(off)));
     }
 
     #[test]
